@@ -140,6 +140,9 @@
           .then(res => res.json())
           .then(json => {
             maskData = json.mask;  // 期待 mask: [w*h] 的扁平数组
+            // 验证掩码数据是否为空或全为0/1种类别
+            const uniqueValues = new Set(maskData);
+            console.log("掩码中的唯一值:", Array.from(uniqueValues));
             drawMask();
           })
           .catch(err => {

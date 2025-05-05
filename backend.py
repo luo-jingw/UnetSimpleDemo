@@ -86,7 +86,13 @@ app.add_middleware(
 # 2. 加载自定义模型的权重
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = UNetPlusPlus(in_channels=3, num_classes=21)
-model.load_state_dict(torch.load("checkpoints/best.pt", map_location=device))
+try:
+    # 添加 weights_only=True 以消除警告
+    weights = torch.load("checkpoints/best.pt", map_location=device, weights_only=True)
+    model.load_state_dict(weights)
+    print("模型加载成功，权重包含以下层:", list(weights.keys())[:5], "...")
+except Exception as e:
+    print(f"模型加载失败: {e}")
 model.to(device)
 model.eval()
 
@@ -101,15 +107,43 @@ async def predict(file: UploadFile = File(...)):
     # 3.1 读取并转换为 RGB
     img_bytes = await file.read()
     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    print(f"接收到图像，大小: {img.size}")
+    
     # 3.2 预处理 + 扩 batch 维度
     x = preprocess(img).unsqueeze(0).to(device)    # [1,3,512,512]
+    print(f"输入张量形状: {x.shape}")
+    
     # 3.3 推理
     with torch.no_grad():
         logits = model(x)                          # [1,21,512,512]
+        print(f"输出 logits 形状: {logits.shape}")
+        print(f"类别分布: {torch.argmax(logits, dim=1).unique().tolist()}")
         mask = torch.argmax(logits, dim=1).squeeze(0)  # [512,512]
+    
     # 3.4 扁平化并返回
     flat = mask.cpu().numpy().flatten().tolist()
+    print(f"返回掩码长度: {len(flat)}, 包含值范围: {min(flat)} - {max(flat)}")
     return {"mask": flat}
+
+# 在 backend.py 中添加调试端点
+@app.get("/test_model")
+async def test_model():
+    # 创建测试图像 (一个纯色图像)
+    test_img = Image.new("RGB", (512, 512), color=(128, 128, 128))
+    x = preprocess(test_img).unsqueeze(0).to(device)
+    
+    with torch.no_grad():
+        logits = model(x)
+        mask = torch.argmax(logits, dim=1).squeeze(0)
+        
+    # 验证模型是否预测多个类别
+    unique_classes = mask.unique().tolist()
+    
+    return {
+        "unique_classes": unique_classes,
+        "logits_shape": list(logits.shape),
+        "max_logit_values": torch.max(logits, dim=1)[0].mean().item()
+    }
 
 if __name__ == "__main__":
     uvicorn.run("backend:app", host="0.0.0.0", port=8000, reload=True)

@@ -1,5 +1,14 @@
-import os, torch
-import numpy as np
+# train_unetpp_voc.py
+# ---------------------------------------------------------
+# UNet++ on PASCAL‑VOC 2012 语义分割 (改进版)
+# 关键改动：
+#   1.  LR = 1e‑2 + 5 epoch linear warm‑up → cosine
+#   2.  BatchNorm → GroupNorm(8) (bs = 8 更稳定)
+#   3.  CE 按 VOC 像素统计加权，DiceLoss 保留
+#   4.  深监督：x0_1 / x0_2 / x0_3 各接 1×1 aux‑head
+#   5.  AMP API 更新：torch.amp.*
+# ---------------------------------------------------------
+import os, random, torch, numpy as np
 from PIL import Image
 from torchvision.datasets import VOCSegmentation
 from torchvision import transforms
@@ -8,196 +17,206 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchmetrics.classification import MulticlassJaccardIndex
 
-# ------------------------------ Custom UNet++ Network ------------------------------ #
+torch.backends.cudnn.benchmark = True
+
+# ------------------------------ Blocks ------------------------------
+def gn(ch):        # GroupNorm wrapper
+    return nn.GroupNorm(8, ch)
+
 class ConvBlock(nn.Module):
     def __init__(self, in_ch, out_ch):
         super().__init__()
         self.conv = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=1),
-            nn.BatchNorm2d(out_ch),
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+            gn(out_ch),
             nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1),
-            nn.BatchNorm2d(out_ch),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+            gn(out_ch),
             nn.ReLU(inplace=True)
         )
-    
-    def forward(self, x):
-        return self.conv(x)
+    def forward(self, x): return self.conv(x)
 
+# ------------------------------ UNet++ ------------------------------
 class UNetPlusPlus(nn.Module):
     def __init__(self, in_channels=3, num_classes=21):
         super().__init__()
-        
-        # Encoder
-        self.enc1 = ConvBlock(in_channels, 64)
-        self.enc2 = ConvBlock(64, 128)
-        self.enc3 = ConvBlock(128, 256)
-        self.enc4 = ConvBlock(256, 512)
-        
-        # Pooling layer
+        ch = [64,128,256,512]
+
+        self.enc = nn.ModuleList([
+            ConvBlock(in_channels, ch[0]),
+            ConvBlock(ch[0],      ch[1]),
+            ConvBlock(ch[1],      ch[2]),
+            ConvBlock(ch[2],      ch[3]),
+        ])
         self.pool = nn.MaxPool2d(2)
-        
-        # Nested skip connections
-        self.conv0_1 = ConvBlock(64 + 128, 64)
-        self.conv1_1 = ConvBlock(128 + 256, 128)
-        self.conv2_1 = ConvBlock(256 + 512, 256)
-        
-        # Fixed channels calculation:
-        # x0_2 input: x0_0(64) + x0_1(64) + up(x1_1)(128) = 256
-        self.conv0_2 = ConvBlock(64 + 64 + 128, 64)  
-        # x1_2 input: x1_0(128) + x1_1(128) + up(x2_1)(256) = 512
-        self.conv1_2 = ConvBlock(128 + 128 + 256, 128)
-        
-        # x0_3 input: x0_0(64) + x0_1(64) + x0_2(64) + up(x1_2)(128) = 320
-        self.conv0_3 = ConvBlock(64 + 64 + 64 + 128, 64)
-        
-        # Upsampling
-        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        
-        # Final output
-        self.final = nn.Conv2d(64, num_classes, 1)
-    
+        self.up   = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+
+        self.dec01 = ConvBlock(ch[0]+ch[1],   ch[0])
+        self.dec11 = ConvBlock(ch[1]+ch[2],   ch[1])
+        self.dec21 = ConvBlock(ch[2]+ch[3],   ch[2])
+
+        self.dec02 = ConvBlock(ch[0]*2+ch[1], ch[0])
+        self.dec12 = ConvBlock(ch[1]*2+ch[2], ch[1])
+
+        self.dec03 = ConvBlock(ch[0]*3+ch[1], ch[0])
+
+        # heads
+        self.head0 = nn.Conv2d(ch[0], num_classes, 1)   # main (x0_3)
+        self.head1 = nn.Conv2d(ch[0], num_classes, 1)   # aux  (x0_2)
+        self.head2 = nn.Conv2d(ch[0], num_classes, 1)   # aux  (x0_1)
+
     def forward(self, x):
-        # Encoder
-        x0_0 = self.enc1(x)
-        x1_0 = self.enc2(self.pool(x0_0))
-        x2_0 = self.enc3(self.pool(x1_0))
-        x3_0 = self.enc4(self.pool(x2_0))
-        
-        # Decoder
-        x0_1 = self.conv0_1(torch.cat([x0_0, self.up(x1_0)], 1))
-        x1_1 = self.conv1_1(torch.cat([x1_0, self.up(x2_0)], 1))
-        x2_1 = self.conv2_1(torch.cat([x2_0, self.up(x3_0)], 1))
-        
-        x0_2 = self.conv0_2(torch.cat([x0_0, x0_1, self.up(x1_1)], 1))
-        x1_2 = self.conv1_2(torch.cat([x1_0, x1_1, self.up(x2_1)], 1))
-        
-        x0_3 = self.conv0_3(torch.cat([x0_0, x0_1, x0_2, self.up(x1_2)], 1))
-        
-        # Output
-        return self.final(x0_3)
+        e0 = self.enc[0](x)
+        e1 = self.enc[1](self.pool(e0))
+        e2 = self.enc[2](self.pool(e1))
+        e3 = self.enc[3](self.pool(e2))
 
+        d01 = self.dec01(torch.cat([e0, self.up(e1)], 1))
+        d11 = self.dec11(torch.cat([e1, self.up(e2)], 1))
+        d21 = self.dec21(torch.cat([e2, self.up(e3)], 1))
 
-def dice_loss(logits, targets, eps: float = 1e-6):
-    """Soft-Dice across all classes, targets ∈ [B,H,W] int"""
+        d02 = self.dec02(torch.cat([e0, d01, self.up(d11)], 1))
+        d12 = self.dec12(torch.cat([e1, d11, self.up(d21)], 1))
+
+        d03 = self.dec03(torch.cat([e0, d01, d02, self.up(d12)], 1))
+
+        out0 = self.head0(d03)         # H/1
+        out1 = self.head1(d02)         # deep‑sup
+        out2 = self.head2(d01)
+        return out0, out1, out2
+
+# ------------------------------ Losses ------------------------------
+def dice_loss(logits, targets, eps=1e-6, weight=None):
     C = logits.shape[1]
-    probs  = F.softmax(logits, 1)
-    onehot = F.one_hot(targets.clamp(0, C - 1), C).permute(0, 3, 1, 2).float()
-    inter  = (probs * onehot).sum((0, 2, 3))
-    union  = probs.sum((0, 2, 3)) + onehot.sum((0, 2, 3))
-    return (1 - (2 * inter + eps) / (union + eps)).mean()
+    p = torch.softmax(logits, 1)
+    y = F.one_hot(targets.clamp(0, C-1), C).permute(0,3,1,2).float()
+    inter = (p*y).sum((0,2,3))
+    union = p.sum((0,2,3)) + y.sum((0,2,3))
+    if weight is None: weight = torch.ones_like(inter)
+    return (1 - (2*inter + eps)/(union + eps) * weight).mean()
 
+# ------------------------------ Utils ------------------------------
+def seed_all(seed=42):
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+
+# ------------------------------ Main ------------------------------
 def main():
-    root, epochs, batch_size = 'voc_data', 100, 8
-    lr, num_classes, out_dir = 5e-4, 21, 'checkpoints'
-    accum_iter, use_amp = 4, True
+    seed_all()
+    root, epochs, bs = 'voc_data', 120, 8
+    base_lr, n_cls, out_dir = 1e-2, 21, 'checkpoints'
+    accum, clip, use_amp = 4, 1.0, True
     os.makedirs(out_dir, exist_ok=True)
 
-    train_img_tf = transforms.Compose([
-        transforms.RandomResizedCrop(512, scale=(0.5, 2.0)),
+    tf_common = dict(size=512, scale=(0.5,2.0))
+    img_tf = transforms.Compose([
+        transforms.RandomResizedCrop(**tf_common),
         transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-    ])
-    train_mask_tf = transforms.Compose([
-        transforms.RandomResizedCrop(512, scale=(0.5, 2.0), interpolation=Image.NEAREST),
+        transforms.ToTensor()])
+    msk_tf = transforms.Compose([
+        transforms.RandomResizedCrop(interpolation=Image.NEAREST, **tf_common),
         transforms.RandomHorizontalFlip(),
-        transforms.PILToTensor(),
-    ])
-    # Validation set: deterministic
+        transforms.PILToTensor()])
     val_img_tf = transforms.Compose([
-        transforms.Resize(544, interpolation=transforms.InterpolationMode.BILINEAR),
-        transforms.CenterCrop(512),
-        transforms.ToTensor(),
-    ])
-    val_mask_tf = transforms.Compose([
+        transforms.Resize(544), transforms.CenterCrop(512), transforms.ToTensor()])
+    val_msk_tf = transforms.Compose([
         transforms.Resize(544, interpolation=Image.NEAREST),
-        transforms.CenterCrop(512),
-        transforms.PILToTensor(),
-    ])
+        transforms.CenterCrop(512), transforms.PILToTensor()])
 
-    train_ds = VOCSegmentation(root=root, year='2012', image_set='train',
-                               download=True,  transform=train_img_tf, target_transform=train_mask_tf)
-    val_ds   = VOCSegmentation(root=root, year='2012', image_set='val',
-                               download=False, transform=val_img_tf,   target_transform=val_mask_tf)
-    train_loader = DataLoader(train_ds, batch_size, True,  num_workers=4, pin_memory=True)
-    val_loader   = DataLoader(val_ds,   batch_size, False, num_workers=4, pin_memory=True)
+    train_ds = VOCSegmentation(root, '2012', 'train', True, img_tf, msk_tf)
+    val_ds   = VOCSegmentation(root, '2012', 'val',   False, val_img_tf, val_msk_tf)
 
-    model = UNetPlusPlus(in_channels=3, num_classes=num_classes)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model.to(device)
-
-    ce_loss   = torch.nn.CrossEntropyLoss(ignore_index=255)
-    optimizer = torch.optim.SGD(model.parameters(), lr, momentum=0.9, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, 
-        max_lr=lr,
-        epochs=epochs,
-        steps_per_epoch=len(train_loader) // accum_iter
+    train_loader = DataLoader(
+    train_ds,
+    batch_size=bs,
+    shuffle=True,
+    num_workers=4,               
+    pin_memory=True,
+    persistent_workers=True,
+    prefetch_factor=4
     )
-    scaler    = torch.amp.GradScaler(device='cuda', enabled=use_amp)
-    miou_fn   = MulticlassJaccardIndex(num_classes=num_classes, ignore_index=255).to(device)
 
-    best_miou = 0.0
-    for epoch in range(1, epochs + 1):
-        model.train()
-        running_loss = 0.0
-        optimizer.zero_grad()
+    val_loader = DataLoader(
+    val_ds,
+    batch_size=bs,
+    shuffle=False,
+    num_workers=4,                
+    pin_memory=True,
+    persistent_workers=True
+    )
 
-        for it, (imgs, masks) in enumerate(train_loader, 1):
-            imgs   = imgs.to(device, non_blocking=True)
-            masks  = masks.squeeze(1).long().to(device, non_blocking=True)
+    dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    net = UNetPlusPlus(num_classes=n_cls).to(dev)
 
-            with torch.amp.autocast(device_type='cuda', enabled=use_amp):
-                logits = model(imgs)
-                loss   = ce_loss(logits, masks) + 0.5 * dice_loss(logits, masks)
+    # ---------- class weights ----------
+    # 像素频率统计值（预先离线算好，顺序与 VOC label 对应，最后一位背景）
+    cls_freq = torch.tensor([
+        0.048,0.007,0.010,0.009,0.008,0.005,0.012,0.004,0.003,0.007,
+        0.002,0.009,0.005,0.004,0.002,0.003,0.003,0.004,0.002,0.002,
+        0.859                             # background
+    ])
+    ce_weight = 1 / torch.log1p(1.02*cls_freq)
 
-            scaler.scale(loss).backward()
-            if it % accum_iter == 0:
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
+    loss_ce = nn.CrossEntropyLoss(ignore_index=255,
+                                  weight=ce_weight.to(dev))
 
-            running_loss += loss.item() * imgs.size(0)
+    opt = torch.optim.SGD(net.parameters(), base_lr,
+                          momentum=0.9, weight_decay=1e-4)
 
-        scheduler.step()
-        train_loss = running_loss / len(train_loader.dataset)
+    warm  = torch.optim.lr_scheduler.LinearLR(opt, start_factor=0.1, total_iters=5)
+    cos   = torch.optim.lr_scheduler.CosineAnnealingLR(opt, epochs-5, eta_min=1e-5)
+    sched = torch.optim.lr_scheduler.SequentialLR(opt, [warm, cos], [5])
 
-        model.eval()
-        val_loss, val_iou = 0.0, 0.0
-        with torch.no_grad(), torch.amp.autocast(device_type='cuda', enabled=use_amp):
-            for imgs, masks in val_loader:
-                imgs  = imgs.to(device, non_blocking=True)
-                masks = masks.squeeze(1).long().to(device, non_blocking=True)
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+    miou   = MulticlassJaccardIndex(num_classes=n_cls, ignore_index=255).to(dev)
 
-                logits = model(imgs)
-                val_loss += (ce_loss(logits, masks) + 0.5 * dice_loss(logits, masks)).item() * imgs.size(0)
+    best = 0.
+    for ep in range(1, epochs+1):
+        net.train(); opt.zero_grad(set_to_none=True); run_loss = 0.
+        for it,(img,mask) in enumerate(train_loader,1):
+            img = img.to(dev,non_blocking=True)
+            mask= mask.squeeze(1).long().to(dev,non_blocking=True)
 
-                preds = torch.argmax(logits, 1)
-                val_iou += miou_fn(preds, masks) * imgs.size(0)
+            with torch.amp.autocast('cuda', dtype=torch.float16, enabled=use_amp):
+                o0,o1,o2 = net(img)
+                main = loss_ce(o0,mask)+0.5*dice_loss(o0,mask)
+                aux1 = loss_ce(o1,mask)
+                aux2 = loss_ce(o2,mask)
+                loss = main + 0.4*aux1 + 0.2*aux2
 
-        val_loss /= len(val_loader.dataset)
-        val_miou  = val_iou / len(val_loader.dataset)
+            scaler.scale(loss/accum).backward()
+            if it%accum==0 or it==len(train_loader):
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(net.parameters(), clip)
+                scaler.step(opt); scaler.update(); opt.zero_grad(set_to_none=True)
+            run_loss += loss.item()*img.size(0)
 
-        print(f"[{epoch:02}/{epochs}] "
-              f"train_loss: {train_loss:.4f}  "
-              f"val_loss: {val_loss:.4f}  "
-              f"mIoU: {val_miou:.3f}  "
-              f"lr: {scheduler.get_last_lr()[0]:.6f}")
+        sched.step()
+        train_loss = run_loss/len(train_loader.dataset)
 
-        if val_miou > best_miou:
-            best_miou = val_miou
-            torch.save(model.state_dict(), os.path.join(out_dir, 'best.pt'))
-        if epoch % 10 == 0:
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'best_miou': best_miou
-            }, os.path.join(out_dir, f'checkpoint_epoch{epoch}.pt'))
+        # ---------------- validation ----------------
+        net.eval(); v_loss=0.; v_iou=0.
+        with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.float16,
+                                                 enabled=use_amp):
+            for img,mask in val_loader:
+                img = img.to(dev,non_blocking=True)
+                mask= mask.squeeze(1).long().to(dev,non_blocking=True)
+                o0,_,_ = net(img)
+                v_loss += (loss_ce(o0,mask)+0.5*dice_loss(o0,mask)).item()*img.size(0)
+                v_iou  += miou(o0.argmax(1),mask)*img.size(0)
+        v_loss/=len(val_loader.dataset); v_miou=v_iou/len(val_loader.dataset)
 
-    torch.save(model.state_dict(), 'unetpp_voc2012_from_scratch.pt')
-    print("Training completed, model saved to unetpp_voc2012_from_scratch.pt")
+        print(f"[{ep:03}/{epochs}]"
+              f" train {train_loss:.3f}  val {v_loss:.3f}"
+              f"  mIoU {v_miou:.3f}  lr {sched.get_last_lr()[0]:.5f}")
 
-if __name__ == '__main__':
+        torch.save({'epoch':ep,'model':net.state_dict()}, os.path.join(out_dir,'latest.pt'))
+        if v_miou>best:
+            best=v_miou
+            torch.save(net.state_dict(), os.path.join(out_dir,'best.pt'))
+
+    torch.save(net.state_dict(), 'unetpp_voc2012_final.pt')
+    print(f"Finished; best mIoU={best:.3f}")
+
+if __name__ == "__main__":
     main()
