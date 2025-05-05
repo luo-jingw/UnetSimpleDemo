@@ -1,125 +1,155 @@
-#!/usr/bin/env python
-# test_unetpp_voc.py
-import os, argparse, torch, importlib
+# voc_dataset_visualization.py
+# ---------------------------------------------------------
+# VOC数据集加载与可视化示例
+# ---------------------------------------------------------
+import os, random, torch, numpy as np
 from PIL import Image
-import numpy as np
-import matplotlib.pyplot as plt
 from torchvision.datasets import VOCSegmentation
 from torchvision import transforms
 from torch.utils.data import DataLoader
-from torchmetrics.classification import MulticlassJaccardIndex, MulticlassAccuracy
-from pickle import UnpicklingError
+import matplotlib.pyplot as plt
+import torch.nn.functional as F
+import cv2  # 添加OpenCV库导入
 
-from train import UNetPlusPlus   # ← 你的训练脚本
+# ------------------------------ Utils ------------------------------
+def seed_all(seed=42):
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
 
-# ---------- Palette ----------
-VOC_PALETTE = np.array([
-    (0,0,0),(128,0,0),(0,128,0),(128,128,0),(0,0,128),
-    (128,0,128),(0,128,128),(128,128,128),(64,0,0),(192,0,0),
-    (64,128,0),(192,128,0),(64,0,128),(192,0,128),(64,128,128),
-    (192,128,128),(0,64,0),(128,64,0),(0,192,0),(128,192,0),(0,64,128)
-], dtype=np.uint8)
+# VOC数据集标签颜色映射（21类，包括背景）
+VOC_COLORMAP = [
+    [0, 0, 0],        # 背景
+    [128, 0, 0],      # 飞机
+    [0, 128, 0],      # 自行车
+    [128, 128, 0],    # 鸟
+    [0, 0, 128],      # 船
+    [128, 0, 128],    # 瓶子
+    [0, 128, 128],    # 公共汽车
+    [128, 128, 128],  # 汽车
+    [64, 0, 0],       # 猫
+    [192, 0, 0],      # 椅子
+    [64, 128, 0],     # 牛
+    [192, 128, 0],    # 餐桌
+    [64, 0, 128],     # 狗
+    [192, 0, 128],    # 马
+    [64, 128, 128],   # 摩托车
+    [192, 128, 128],  # 人
+    [0, 64, 0],       # 盆栽植物
+    [128, 64, 0],     # 羊
+    [0, 192, 0],      # 沙发
+    [128, 192, 0],    # 火车
+    [0, 64, 128]      # 电视/显示器
+]
 
-def colorize(m): return VOC_PALETTE[m]
+# VOC标签名称
+VOC_CLASSES = [
+    'background', 'aeroplane', 'bicycle', 'bird', 'boat', 'bottle', 'bus',
+    'car', 'cat', 'chair', 'cow', 'diningtable', 'dog', 'horse',
+    'motorbike', 'person', 'pottedplant', 'sheep', 'sofa', 'train', 'tvmonitor'
+]
 
-def save_vis(img_t, gt, pred, path):
-    img = (img_t.numpy().transpose(1,2,0)*255).astype(np.uint8)
-    fig,axs = plt.subplots(1,3,figsize=(12,4))
-    for ax,d,t in zip(axs,[img,colorize(gt),colorize(pred)],['Image','GT','Pred']):
-        ax.imshow(d); ax.set_title(t); ax.axis('off')
-    plt.tight_layout(); plt.savefig(path); plt.close()
+# 将分割掩码转换为RGB彩色图像
+def decode_segmap(mask):
+    """
+    将分割掩码转换为RGB彩色图像
+    mask: [H, W] 的张量，值为0-20的类别索引
+    返回: [H, W, 3] 的numpy数组，RGB彩色图
+    """
+    mask = mask.numpy()
+    h, w = mask.shape
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    
+    for cls in range(21):
+        rgb[mask == cls] = VOC_COLORMAP[cls]
+            
+    return rgb
 
-# ---------- Loader ----------
-def build_loader(split, bs, *, force_size=None):
-    if force_size:
-        img_tf = transforms.Compose([
-            transforms.Resize(force_size, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(force_size),
-            transforms.ToTensor()])
-        mask_tf = transforms.Compose([
-            transforms.Resize(force_size, interpolation=Image.NEAREST),
-            transforms.CenterCrop(force_size),
-            transforms.PILToTensor()])
-    else:
-        img_tf, mask_tf = transforms.ToTensor(), transforms.PILToTensor()
+# ------------------------------ Main ------------------------------
+def main():
+    seed_all()
+    root = 'voc_data'
+    batch_size = 4
+    num_samples = 5  # 可视化的样本数量
+    
+    # 简化的数据转换
+    val_img_tf = transforms.Compose([
+        transforms.Resize(512), 
+        transforms.CenterCrop(512), 
+        transforms.ToTensor()
+    ])
+    val_msk_tf = transforms.Compose([
+        transforms.Resize(512, interpolation=Image.NEAREST),
+        transforms.CenterCrop(512), 
+        transforms.PILToTensor()
+    ])
 
-    ds = VOCSegmentation('voc_data', year='2012', image_set=split,
-                         download=(split=='train'),
-                         transform=img_tf, target_transform=mask_tf)
-    return DataLoader(ds, bs, shuffle=False, num_workers=4, pin_memory=True)
+    # 加载数据集
+    print("正在加载VOC数据集...")
+    val_ds = VOCSegmentation(root, '2012', 'val', False, val_img_tf, val_msk_tf)
+    print(f"数据集加载完成! 总共有 {len(val_ds)} 个样本")
+    
+    # 创建数据加载器
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=True,  # 随机抽取样本
+        num_workers=2
+    )
+    
+    # 可视化一些样本
+    print("可视化部分数据样本...")
+    plt.figure(figsize=(15, 5*num_samples))
+    
+    for i, (images, masks) in enumerate(val_loader):
+        if i >= num_samples:
+            break
+            
+        # 展示这个批次中的第一个样本
+        img = images[0].permute(1, 2, 0).numpy()
+        # 将图像从[0,1]转换为[0,255]
+        img = (img * 255).astype(np.uint8)
+        
+        # 处理掩码
+        mask = masks[0].squeeze(0)
+        # VOC掩码中255表示忽略的区域，我们将其设为0（背景）
+        mask[mask == 255] = 0
+        
+        # 将掩码转换为彩色图
+        color_mask = decode_segmap(mask)
+        
+        # 创建半透明叠加效果
+        overlay = img.copy()
+        cv_mask = color_mask.copy()
+        alpha = 0.4  # 透明度
+        
+        # 修正叠加效果实现
+        cv_mask = cv2.addWeighted(cv_mask, alpha, img, 1 - alpha, 0)
+        
+        # 在同一行展示原图、分割掩码和叠加效果
+        plt.subplot(num_samples, 3, i*3+1)
+        plt.title("原图")
+        plt.imshow(img)
+        plt.axis('off')
+        
+        plt.subplot(num_samples, 3, i*3+2)
+        plt.title("分割掩码")
+        plt.imshow(color_mask)
+        plt.axis('off')
+        
+        plt.subplot(num_samples, 3, i*3+3)
+        plt.title("叠加效果")
+        plt.imshow(cv_mask)
+        plt.axis('off')
+        
+        # 统计掩码中存在的类别
+        unique_classes = torch.unique(mask).numpy()
+        class_names = [VOC_CLASSES[cls] for cls in unique_classes if cls < 21]
+        print(f"样本 {i+1} 中的类别: {', '.join(class_names)}")
+    
+    plt.tight_layout()
+    plt.savefig('voc_visualization.png')
+    print("可视化结果已保存为 'voc_visualization.png'")
+    plt.show()
 
-# ---------- Safe checkpoint load ----------
-def safe_load(path, device):
-    try:
-        ckpt = torch.load(path, map_location=device, weights_only=True)
-        return ckpt['model'] if isinstance(ckpt,dict) and 'model' in ckpt else ckpt
-    except UnpicklingError:
-        smp_mod = importlib.import_module(
-            'segmentation_models_pytorch.decoders.unetplusplus.model')
-        torch.serialization.add_safe_globals({smp_mod.UnetPlusPlus})
-        full = torch.load(path, map_location=device, weights_only=False)
-        if isinstance(full, dict) and 'model' in full: return full['model']
-        if isinstance(full, torch.nn.Module):          return full.state_dict()
-        raise RuntimeError("Unsupported checkpoint format")
-
-# ---------- Evaluate ----------
-def evaluate(args):
-    dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    net = UNetPlusPlus(num_classes=21).to(dev)
-    net.load_state_dict(safe_load(args.weights, dev), strict=False)
-    net.eval()
-
-    miou = MulticlassJaccardIndex(num_classes=21, ignore_index=255).to(dev)
-    pix  = MulticlassAccuracy(num_classes=21, average='micro', ignore_index=255).to(dev)
-
-    loader = build_loader('val', args.batch_size, force_size=512)   # ★ FIX
-    with torch.no_grad(), torch.amp.autocast('cuda', enabled=args.amp):  # ★ FIX
-        for i,(img,mask) in enumerate(loader,1):
-            img = img.to(dev); mask = mask.squeeze(1).long().to(dev)
-            pred = net(img).argmax(1)
-            miou.update(pred,mask); pix.update(pred,mask)
-
-            if args.vis_every and i%args.vis_every==0:
-                os.makedirs(args.out_dir, exist_ok=True)
-                for k in range(min(args.save_vis, img.size(0))):
-                    save_vis(img[k].cpu(), mask[k].cpu().numpy(),
-                             pred[k].cpu().numpy(),
-                             os.path.join(args.out_dir,f'vis_{i}_{k}.png'))
-    print(f"\nValidation  mIoU: {miou.compute():.3f}   PixelAcc: {pix.compute():.3f}")
-
-# ---------- Sanity ----------
-def sanity_overfit(args):
-    dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    net = UNetPlusPlus(num_classes=21).to(dev)
-    img,mask = next(iter(build_loader('train',1,force_size=512)))
-    img = img.to(dev); mask = mask.squeeze(1).long().to(dev)
-
-    opt = torch.optim.Adam(net.parameters(),1e-3)
-    ce  = torch.nn.CrossEntropyLoss(ignore_index=255)
-    print(">>> sanity check")
-    for it in range(1,101):
-        net.train(); opt.zero_grad()
-        logit = net(img); loss = ce(logit,mask); loss.backward(); opt.step()
-        if it%10==0:
-            pa = (logit.argmax(1)==mask).float().mean().item()
-            print(f"[{it:03d}/100] loss={loss.item():.4f}  pixel_acc={pa:.3f}")
-
-    os.makedirs(args.out_dir, exist_ok=True)
-    save_vis(img[0].cpu(), mask[0].cpu().numpy(),
-             logit.argmax(1)[0].cpu().numpy(),
-             os.path.join(args.out_dir,'sanity.png'))
-
-# ---------- CLI ----------
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--weights", default="checkpoints/best.pt")
-    ap.add_argument("--batch-size", type=int, default=8)
-    ap.add_argument("--amp", action="store_true")
-    ap.add_argument("--vis-every", type=int, default=0)
-    ap.add_argument("--save-vis", type=int, default=3)
-    ap.add_argument("--out-dir", default="test_vis")
-    ap.add_argument("--sanity", action="store_true")
-    args = ap.parse_args()
-
-    if args.sanity: sanity_overfit(args)
-    else:           evaluate(args)
+    main()
