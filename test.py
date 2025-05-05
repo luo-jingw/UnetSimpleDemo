@@ -1,61 +1,38 @@
-# voc_dataset_visualization.py
+# test_train.py
 # ---------------------------------------------------------
-# VOC数据集加载与可视化示例
+# UNet++ on PASCAL-VOC 2012语义分割 - 训练和测试
 # ---------------------------------------------------------
 import os, random, torch, numpy as np
+import time
 from PIL import Image
-from torchvision.datasets import VOCSegmentation
-from torchvision import transforms
 from torch.utils.data import DataLoader
-import matplotlib.pyplot as plt
+import torch.nn as nn
+import torch.optim as optim
 import torch.nn.functional as F
-import cv2  # 添加OpenCV库导入
+import matplotlib.pyplot as plt
+import cv2
+from torchmetrics.classification import MulticlassJaccardIndex  # IoU计算
+
+# 导入自定义网络和数据集
+from UnetppModel import UNetPlusPlus
+from DatasetVoc2012 import VOC2012Dataset, VOC_COLORMAP, VOC_CLASSES
 
 # ------------------------------ Utils ------------------------------
 def seed_all(seed=42):
     random.seed(seed); np.random.seed(seed)
     torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
-
-# VOC数据集标签颜色映射（21类，包括背景）
-VOC_COLORMAP = [
-    [0, 0, 0],        # 背景
-    [128, 0, 0],      # 飞机
-    [0, 128, 0],      # 自行车
-    [128, 128, 0],    # 鸟
-    [0, 0, 128],      # 船
-    [128, 0, 128],    # 瓶子
-    [0, 128, 128],    # 公共汽车
-    [128, 128, 128],  # 汽车
-    [64, 0, 0],       # 猫
-    [192, 0, 0],      # 椅子
-    [64, 128, 0],     # 牛
-    [192, 128, 0],    # 餐桌
-    [64, 0, 128],     # 狗
-    [192, 0, 128],    # 马
-    [64, 128, 128],   # 摩托车
-    [192, 128, 128],  # 人
-    [0, 64, 0],       # 盆栽植物
-    [128, 64, 0],     # 羊
-    [0, 192, 0],      # 沙发
-    [128, 192, 0],    # 火车
-    [0, 64, 128]      # 电视/显示器
-]
-
-# VOC标签名称
-VOC_CLASSES = [
-    'background', 'aeroplane', 'bicycle', 'bird', 'boat', 'bottle', 'bus',
-    'car', 'cat', 'chair', 'cow', 'diningtable', 'dog', 'horse',
-    'motorbike', 'person', 'pottedplant', 'sheep', 'sofa', 'train', 'tvmonitor'
-]
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 # 将分割掩码转换为RGB彩色图像
 def decode_segmap(mask):
     """
-    将分割掩码转换为RGB彩色图像
-    mask: [H, W] 的张量，值为0-20的类别索引
-    返回: [H, W, 3] 的numpy数组，RGB彩色图
+    Convert segmentation mask to RGB color image
+    mask: [H, W] tensor with class indices 0-20
+    returns: [H, W, 3] numpy array, RGB color image
     """
-    mask = mask.numpy()
+    if isinstance(mask, torch.Tensor):
+        mask = mask.detach().cpu().numpy()
     h, w = mask.shape
     rgb = np.zeros((h, w, 3), dtype=np.uint8)
     
@@ -64,92 +41,277 @@ def decode_segmap(mask):
             
     return rgb
 
+# 计算交叉熵损失，忽略标签为255的像素
+def cross_entropy_loss(pred, target):
+    return F.cross_entropy(pred, target, ignore_index=255, reduction='mean')
+
+# Dice Loss实现
+def dice_loss(pred, target, smooth=1.0):
+    pred = F.softmax(pred, dim=1)
+    
+    # 忽略255标签（边界区域）
+    valid_mask = (target != 255)
+    target = target * valid_mask
+    
+    # one-hot编码
+    target_one_hot = torch.zeros_like(pred)
+    target_one_hot.scatter_(1, target.unsqueeze(1), 1)
+    
+    # 计算Dice系数
+    intersection = (pred * target_one_hot).sum(dim=(2, 3))
+    union = pred.sum(dim=(2, 3)) + target_one_hot.sum(dim=(2, 3))
+    dice = (2. * intersection + smooth) / (union + smooth)
+    
+    return 1 - dice.mean()
+
+# ------------------------------ 训练函数 ------------------------------
+def train_one_epoch(model, train_loader, optimizer, device, epoch):
+    model.train()
+    total_loss = 0
+    batch_count = len(train_loader)
+    start_time = time.time()
+    
+    for batch_idx, (data, target) in enumerate(train_loader):
+        # 转移数据到设备
+        data, target = data.to(device), target.to(device)
+        
+        # 清除梯度
+        optimizer.zero_grad()
+        
+        # 前向传播 - 使用深度监督
+        output0, output1, output2 = model(data)
+        
+        # 计算损失 - 主输出和辅助输出
+        main_loss = cross_entropy_loss(output0, target) + 0.5 * dice_loss(output0, target)
+        aux1_loss = cross_entropy_loss(output1, target)
+        aux2_loss = cross_entropy_loss(output2, target)
+        
+        # 组合损失
+        loss = main_loss + 0.4 * aux1_loss + 0.2 * aux2_loss
+        
+        # 反向传播
+        loss.backward()
+        
+        # 更新参数
+        optimizer.step()
+        
+        # 累计损失
+        total_loss += loss.item()
+        
+        # 打印训练信息
+        if batch_idx % 10 == 0:
+            print(f'Train Epoch: {epoch} [{batch_idx}/{batch_count} ({100. * batch_idx / batch_count:.0f}%)]\tLoss: {loss.item():.6f}')
+    
+    # 计算平均损失和训练时间
+    avg_loss = total_loss / batch_count
+    epoch_time = time.time() - start_time
+    print(f'Train Epoch: {epoch}, Average Loss: {avg_loss:.6f}, Time: {epoch_time:.2f}s')
+    
+    return avg_loss
+
+# ------------------------------ 验证函数 ------------------------------
+def validate(model, val_loader, device):
+    model.eval()
+    val_loss = 0
+    miou = MulticlassJaccardIndex(num_classes=21, ignore_index=255).to(device)
+    iou_score = 0
+    batch_count = len(val_loader)
+    
+    with torch.no_grad():
+        for data, target in val_loader:
+            data, target = data.to(device), target.to(device)
+            
+            # 前向传播
+            output0, _, _ = model(data)
+            
+            # 计算损失
+            loss = cross_entropy_loss(output0, target) + 0.5 * dice_loss(output0, target)
+            val_loss += loss.item()
+            
+            # 计算IoU
+            pred = output0.argmax(dim=1)
+            iou_score += miou(pred, target)
+    
+    # 计算平均损失和IoU
+    avg_loss = val_loss / batch_count
+    avg_iou = iou_score / batch_count
+    print(f'Validation: Average Loss: {avg_loss:.6f}, mIoU: {avg_iou:.6f}')
+    
+    return avg_loss, avg_iou
+
+# ------------------------------ 可视化预测结果 ------------------------------
+def visualize_predictions(model, val_loader, device, num_samples=3):
+    model.eval()
+    
+    fig, axes = plt.subplots(num_samples, 3, figsize=(15, 5*num_samples))
+    
+    with torch.no_grad():
+        # 获取指定数量的样本
+        for i, (images, masks) in enumerate(val_loader):
+            if i >= num_samples:
+                break
+                
+            # 获取一个批次中的第一个样本
+            image = images[0:1].to(device)
+            mask = masks[0].cpu()
+            
+            # 模型预测
+            outputs, _, _ = model(image)
+            pred = outputs[0].argmax(0).cpu()
+            
+            # 转换为可视化格式
+            img_np = images[0].permute(1, 2, 0).numpy()
+            img_np = (img_np * 255).astype(np.uint8)
+            
+            # 在VOC掩码中，255表示忽略区域，显示时将其设为0（背景）
+            mask_vis = mask.clone()
+            mask_vis[mask_vis == 255] = 0
+            
+            # 转换为彩色图
+            gt_color = decode_segmap(mask_vis)
+            pred_color = decode_segmap(pred)
+            
+            # 显示原图
+            axes[i, 0].imshow(img_np)
+            axes[i, 0].set_title("Original Image")
+            axes[i, 0].axis('off')
+            
+            # 显示真实掩码
+            axes[i, 1].imshow(gt_color)
+            axes[i, 1].set_title("Ground Truth")
+            axes[i, 1].axis('off')
+            
+            # 显示预测掩码
+            axes[i, 2].imshow(pred_color)
+            axes[i, 2].set_title("Prediction")
+            axes[i, 2].axis('off')
+            
+            # 输出类别信息
+            gt_classes = [VOC_CLASSES[cls] for cls in torch.unique(mask_vis).numpy() if cls < 21]
+            pred_classes = [VOC_CLASSES[cls] for cls in torch.unique(pred).numpy() if cls < 21]
+            print(f"Sample {i+1}:")
+            print(f"  Ground Truth: {', '.join(gt_classes)}")
+            print(f"  Prediction: {', '.join(pred_classes)}")
+    
+    plt.tight_layout()
+    plt.savefig('prediction_visualization.png')
+    print("Prediction visualization saved as 'prediction_visualization.png'")
+    plt.show()
+
 # ------------------------------ Main ------------------------------
 def main():
+    # 设置随机种子
     seed_all()
-    root = 'voc_data'
-    batch_size = 4
-    num_samples = 5  # 可视化的样本数量
     
-    # 简化的数据转换
-    val_img_tf = transforms.Compose([
-        transforms.Resize(512), 
-        transforms.CenterCrop(512), 
-        transforms.ToTensor()
-    ])
-    val_msk_tf = transforms.Compose([
-        transforms.Resize(512, interpolation=Image.NEAREST),
-        transforms.CenterCrop(512), 
-        transforms.PILToTensor()
-    ])
-
-    # 加载数据集
-    print("正在加载VOC数据集...")
-    val_ds = VOCSegmentation(root, '2012', 'val', False, val_img_tf, val_msk_tf)
-    print(f"数据集加载完成! 总共有 {len(val_ds)} 个样本")
+    # 配置参数
+    root = 'voc_data'
+    img_size = 512
+    batch_size = 4
+    num_epochs = 2  # 为快速测试设置的小轮数
+    learning_rate = 1e-3
+    num_workers = 2
+    
+    # 选择设备
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # 创建数据集
+    print("Loading datasets...")
+    train_ds = VOC2012Dataset(root=root, split='train', img_size=img_size)
+    val_ds = VOC2012Dataset(root=root, split='val', img_size=img_size)
+    
+    print(f"Train dataset: {len(train_ds)} samples")
+    print(f"Val dataset: {len(val_ds)} samples")
     
     # 创建数据加载器
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=batch_size,
-        shuffle=True,  # 随机抽取样本
-        num_workers=2
-    )
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
     
-    # 可视化一些样本
-    print("可视化部分数据样本...")
-    plt.figure(figsize=(15, 5*num_samples))
+    # 创建模型
+    print("Initializing UNet++ model...")
+    model = UNetPlusPlus(in_channels=3, num_classes=21, deep_supervision=True).to(device)
     
-    for i, (images, masks) in enumerate(val_loader):
-        if i >= num_samples:
-            break
-            
-        # 展示这个批次中的第一个样本
-        img = images[0].permute(1, 2, 0).numpy()
-        # 将图像从[0,1]转换为[0,255]
+    # 打印模型结构和参数数量
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model parameters: {total_params:,}")
+    
+    # 定义优化器和学习率调度器
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+    
+    # 可视化一些训练样本
+    print("\nVisualizing training samples...")
+    sample_batch = next(iter(train_loader))
+    sample_images, sample_masks = sample_batch
+    
+    plt.figure(figsize=(15, 10))
+    for i in range(min(4, batch_size)):
+        # 转换为NumPy数组
+        img = sample_images[i].permute(1, 2, 0).numpy()
         img = (img * 255).astype(np.uint8)
         
-        # 处理掩码
-        mask = masks[0].squeeze(0)
-        # VOC掩码中255表示忽略的区域，我们将其设为0（背景）
+        mask = sample_masks[i].clone()
+        # 将255（忽略区域）设为0（背景）用于可视化
         mask[mask == 255] = 0
-        
-        # 将掩码转换为彩色图
         color_mask = decode_segmap(mask)
         
         # 创建半透明叠加效果
-        overlay = img.copy()
-        cv_mask = color_mask.copy()
-        alpha = 0.4  # 透明度
+        overlay = cv2.addWeighted(color_mask, 0.4, img, 0.6, 0)
         
-        # 修正叠加效果实现
-        cv_mask = cv2.addWeighted(cv_mask, alpha, img, 1 - alpha, 0)
-        
-        # 在同一行展示原图、分割掩码和叠加效果
-        plt.subplot(num_samples, 3, i*3+1)
-        plt.title("原图")
+        # 显示图像
+        plt.subplot(2, 4, i+1)
+        plt.title(f"Image {i+1}")
         plt.imshow(img)
         plt.axis('off')
         
-        plt.subplot(num_samples, 3, i*3+2)
-        plt.title("分割掩码")
-        plt.imshow(color_mask)
+        plt.subplot(2, 4, i+5)
+        plt.title(f"Mask {i+1}")
+        plt.imshow(overlay)
         plt.axis('off')
-        
-        plt.subplot(num_samples, 3, i*3+3)
-        plt.title("叠加效果")
-        plt.imshow(cv_mask)
-        plt.axis('off')
-        
-        # 统计掩码中存在的类别
-        unique_classes = torch.unique(mask).numpy()
-        class_names = [VOC_CLASSES[cls] for cls in unique_classes if cls < 21]
-        print(f"样本 {i+1} 中的类别: {', '.join(class_names)}")
     
-    plt.tight_layout()
-    plt.savefig('voc_visualization.png')
-    print("可视化结果已保存为 'voc_visualization.png'")
+    plt.savefig('training_samples.png')
+    print("Training samples visualization saved as 'training_samples.png'")
     plt.show()
+    
+    # 训练模型
+    print("\nStarting training...")
+    train_losses = []
+    val_losses = []
+    val_ious = []
+    best_iou = 0.0
+    
+    for epoch in range(1, num_epochs + 1):
+        print(f"\nEpoch {epoch}/{num_epochs}")
+        
+        # 训练一个周期
+        train_loss = train_one_epoch(model, train_loader, optimizer, device, epoch)
+        train_losses.append(train_loss)
+        
+        # 验证
+        val_loss, val_iou = validate(model, val_loader, device)
+        val_losses.append(val_loss)
+        val_ious.append(val_iou)
+        
+        # 学习率调度
+        scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
+        print(f"Current learning rate: {current_lr:.6f}")
+        
+        # 保存最佳模型
+        if val_iou > best_iou:
+            best_iou = val_iou
+            torch.save(model.state_dict(), 'checkpoints/test_best.pt')
+            print(f"New best model saved! IoU: {best_iou:.6f}")
+    
+    print(f"Training completed! Best mIoU: {best_iou:.6f}")
+    
+    # 加载最佳模型进行可视化
+    print("\nLoading best model for visualization...")
+    model.load_state_dict(torch.load('checkpoints/test_best.pt'))
+    
+    # 可视化预测结果
+    print("Visualizing predictions...")
+    visualize_predictions(model, val_loader, device)
 
 if __name__ == "__main__":
     main()
