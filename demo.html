@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>UNet++ Segmentation Demo</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      padding: 20px;
+    }
+    #upload-box {
+      border: 2px dashed #888;
+      padding: 40px;
+      text-align: center;
+      color: #666;
+      margin-bottom: 20px;
+      cursor: pointer;
+    }
+    #upload-box.hover {
+      border-color: #444;
+      color: #444;
+    }
+    #canvasContainer {
+      position: relative;
+      display: inline-block;
+    }
+    canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+    }
+    #controls {
+      margin-bottom: 10px;
+    }
+    #controls label, #controls select {
+      margin-right: 10px;
+    }
+  </style>
+</head>
+<body>
+
+  <h2>UNet++ Segmentation Demo</h2>
+
+  <div id="upload-box">
+    拖入或点击上传图片<br>
+    <input type="file" id="fileInput" accept="image/*" style="display:none">
+  </div>
+
+  <div id="controls" style="display:none">
+    <label for="categorySelect">选择类别：</label>
+    <select id="categorySelect"></select>
+  </div>
+
+  <div id="canvasContainer" style="display:none">
+    <canvas id="imageCanvas"></canvas>
+    <canvas id="maskCanvas"></canvas>
+  </div>
+
+  <script>
+    // VOC 2012 类别映射
+    const VOC_CLASSES = [
+      'background','aeroplane','bicycle','bird','boat',
+      'bottle','bus','car','cat','chair',
+      'cow','diningtable','dog','horse','motorbike',
+      'person','pottedplant','sheep','sofa','train','tvmonitor'
+    ];
+
+    const uploadBox = document.getElementById('upload-box');
+    const fileInput = document.getElementById('fileInput');
+    const categorySelect = document.getElementById('categorySelect');
+    const controls = document.getElementById('controls');
+    const canvasContainer = document.getElementById('canvasContainer');
+    const imageCanvas = document.getElementById('imageCanvas');
+    const maskCanvas = document.getElementById('maskCanvas');
+
+    let maskData = null;
+    let imgWidth = 0, imgHeight = 0;
+
+    // 填充类别下拉
+    VOC_CLASSES.forEach((name, idx) => {
+      const opt = document.createElement('option');
+      opt.value = idx;
+      opt.text = `${idx}: ${name}`;
+      categorySelect.appendChild(opt);
+    });
+
+    // 事件绑定
+    uploadBox.addEventListener('click', () => fileInput.click());
+    uploadBox.addEventListener('dragover', e => {
+      e.preventDefault();
+      uploadBox.classList.add('hover');
+    });
+    uploadBox.addEventListener('dragleave', () => uploadBox.classList.remove('hover'));
+    uploadBox.addEventListener('drop', e => {
+      e.preventDefault();
+      uploadBox.classList.remove('hover');
+      handleFile(e.dataTransfer.files[0]);
+    });
+    fileInput.addEventListener('change', () => handleFile(fileInput.files[0]));
+    categorySelect.addEventListener('change', () => {
+      if (maskData) drawMask();
+    });
+
+    function handleFile(file) {
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = evt => {
+        const img = new Image();
+        img.onload = () => processImage(img);
+        img.src = evt.target.result;
+      };
+      reader.readAsDataURL(file);
+    }
+
+    function processImage(img) {
+      imgWidth  = img.width;
+      imgHeight = img.height;
+      [imageCanvas, maskCanvas].forEach(cv => {
+        cv.width  = imgWidth;
+        cv.height = imgHeight;
+      });
+      // 画原图
+      const ctx = imageCanvas.getContext('2d');
+      ctx.clearRect(0, 0, imgWidth, imgHeight);
+      ctx.drawImage(img, 0, 0, imgWidth, imgHeight);
+
+      // 显示控件
+      controls.style.display = 'block';
+      canvasContainer.style.display = 'inline-block';
+
+      // 发送到后端
+      sendToBackend();
+    }
+
+    function sendToBackend() {
+      imageCanvas.toBlob(blob => {
+        const form = new FormData();
+        form.append('file', blob, 'input.png');
+        fetch('http://127.0.0.1:8000/predict', { method: 'POST', body: form })
+          .then(res => res.json())
+          .then(json => {
+            maskData = json.mask;  // 期待 mask: [w*h] 的扁平数组
+            drawMask();
+          })
+          .catch(err => {
+            console.error('预测失败', err);
+            alert('模型推理失败，请检查后端 /predict 接口');
+          });
+      });
+    }
+
+    function drawMask() {
+      const categoryId = parseInt(categorySelect.value);
+      const ctx = maskCanvas.getContext('2d');
+      const imgData = ctx.createImageData(imgWidth, imgHeight);
+      for (let i = 0, len = maskData.length; i < len; i++) {
+        const lbl = maskData[i];
+        const j = i * 4;
+        if (lbl === categoryId) {
+          imgData.data[j + 0] = 255; // R
+          imgData.data[j + 1] = 0;   // G
+          imgData.data[j + 2] = 0;   // B
+          imgData.data[j + 3] = 128; // 0.5 alpha
+        } else {
+          imgData.data[j + 3] = 0;
+        }
+      }
+      ctx.putImageData(imgData, 0, 0);
+    }
+  </script>
+
+</body>
+</html>
