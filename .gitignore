@@ -1,2 +1,8 @@
-voc_data/
-checkpoints/
+*
+!.gitignore
+! test.py
+! train.py
+! Dataset.py
+! UnetppModel.py
+! backend.py
+! demo.html

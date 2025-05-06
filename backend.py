@@ -1,5 +1,6 @@
 # backend.py
 import io
+import base64
 import uvicorn
 import torch
 import torch.nn as nn
@@ -8,6 +9,7 @@ from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 from torchvision import transforms
+import numpy as np
 
 # Define model structure to ensure compatibility when loading weights
 class ConvBlock(nn.Module):
@@ -109,6 +111,9 @@ async def predict(file: UploadFile = File(...)):
     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     print(f"Received image, size: {img.size}")
     
+    # Store original image dimensions
+    original_width, original_height = img.size
+    
     # 3.2 Preprocess + add batch dimension
     x = preprocess(img).unsqueeze(0).to(device)    # [1,3,512,512]
     print(f"Input tensor shape: {x.shape}")
@@ -117,13 +122,38 @@ async def predict(file: UploadFile = File(...)):
     with torch.no_grad():
         logits = model(x)                          # [1,21,512,512]
         print(f"Output logits shape: {logits.shape}")
-        print(f"Class distribution: {torch.argmax(logits, dim=1).unique().tolist()}")
-        mask = torch.argmax(logits, dim=1).squeeze(0)  # [512,512]
+        
+        # Get probabilities with softmax
+        probs = F.softmax(logits, dim=1)
+        
+        # Get predicted class and confidence score
+        confidence, mask = torch.max(probs, dim=1)
+        
+        # Extract as numpy arrays
+        mask = mask.squeeze(0).cpu().numpy()  # [512,512]
+        confidence = confidence.squeeze(0).cpu().numpy()  # [512,512]
+        
+        print(f"Class distribution: {np.unique(mask).tolist()}")
     
-    # 3.4 Flatten and return
-    flat = mask.cpu().numpy().flatten().tolist()
-    print(f"Returned mask length: {len(flat)}, value range: {min(flat)} - {max(flat)}")
-    return {"mask": flat}
+    # 3.4 Return mask data and original image dimensions
+    flat_mask = mask.flatten().tolist()
+    flat_confidence = confidence.flatten().tolist()
+    
+    # Calculate average confidence per class
+    class_confidences = {}
+    for cls in np.unique(mask):
+        class_confidences[int(cls)] = float(np.mean(confidence[mask == cls]))
+    
+    print(f"Returned mask length: {len(flat_mask)}, value range: {min(flat_mask)} - {max(flat_mask)}")
+    return {
+        "mask": flat_mask,
+        "confidence": flat_confidence,
+        "class_confidences": class_confidences,
+        "width": original_width,
+        "height": original_height,
+        "model_width": 512,
+        "model_height": 512
+    }
 
 # Add debug endpoint to backend.py
 @app.get("/test_model")
