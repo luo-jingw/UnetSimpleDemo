@@ -43,10 +43,17 @@ def decode_segmap(mask):
 
 # 计算交叉熵损失，忽略标签为255的像素
 def cross_entropy_loss(pred, target):
+    # 确保目标掩码是Long类型
+    if target.dtype != torch.long:
+        target = target.long()
     return F.cross_entropy(pred, target, ignore_index=255, reduction='mean')
 
 # Dice Loss实现
 def dice_loss(pred, target, smooth=1.0):
+    # 确保target是Long类型
+    if target.dtype != torch.long:
+        target = target.long()
+        
     pred = F.softmax(pred, dim=1)
     
     # 忽略255标签（边界区域）
@@ -70,6 +77,10 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch):
     total_loss = 0
     batch_count = len(train_loader)
     start_time = time.time()
+    
+    # 添加mIoU计算
+    miou = MulticlassJaccardIndex(num_classes=21, ignore_index=255).to(device)
+    iou_score = 0
     
     for batch_idx, (data, target) in enumerate(train_loader):
         # 转移数据到设备
@@ -98,16 +109,22 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch):
         # 累计损失
         total_loss += loss.item()
         
+        # 计算训练中的IoU（使用主输出）
+        with torch.no_grad():
+            pred = output0.argmax(dim=1)
+            iou_score += miou(pred, target)
+        
         # 打印训练信息
         if batch_idx % 10 == 0:
             print(f'Train Epoch: {epoch} [{batch_idx}/{batch_count} ({100. * batch_idx / batch_count:.0f}%)]\tLoss: {loss.item():.6f}')
     
     # 计算平均损失和训练时间
     avg_loss = total_loss / batch_count
+    avg_iou = iou_score / batch_count
     epoch_time = time.time() - start_time
-    print(f'Train Epoch: {epoch}, Average Loss: {avg_loss:.6f}, Time: {epoch_time:.2f}s')
+    print(f'Train Epoch: {epoch}, Average Loss: {avg_loss:.6f}, mIoU: {avg_iou:.6f}, Time: {epoch_time:.2f}s')
     
-    return avg_loss
+    return avg_loss, avg_iou
 
 # ------------------------------ 验证函数 ------------------------------
 def validate(model, val_loader, device):
@@ -276,6 +293,7 @@ def main():
     # 训练模型
     print("\nStarting training...")
     train_losses = []
+    train_ious = []  # 添加训练IoU记录
     val_losses = []
     val_ious = []
     best_iou = 0.0
@@ -284,8 +302,9 @@ def main():
         print(f"\nEpoch {epoch}/{num_epochs}")
         
         # 训练一个周期
-        train_loss = train_one_epoch(model, train_loader, optimizer, device, epoch)
+        train_loss, train_iou = train_one_epoch(model, train_loader, optimizer, device, epoch)
         train_losses.append(train_loss)
+        train_ious.append(train_iou)  # 记录训练IoU
         
         # 验证
         val_loss, val_iou = validate(model, val_loader, device)
@@ -304,6 +323,39 @@ def main():
             print(f"New best model saved! IoU: {best_iou:.6f}")
     
     print(f"Training completed! Best mIoU: {best_iou:.6f}")
+    
+    # 绘制训练和验证的损失与IoU曲线
+    plt.figure(figsize=(15, 5))
+    
+    # 损失曲线
+    plt.subplot(1, 2, 1)
+    plt.plot(range(1, num_epochs + 1), train_losses, 'b-', label='Training Loss')
+    plt.plot(range(1, num_epochs + 1), val_losses, 'r-', label='Validation Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.title('Loss Curves')
+    plt.grid(True)
+    
+    # IoU曲线
+    plt.subplot(1, 2, 2)
+    plt.plot(range(1, num_epochs + 1), train_ious, 'b-', label='Training mIoU')
+    plt.plot(range(1, num_epochs + 1), val_ious, 'r-', label='Validation mIoU')
+    plt.xlabel('Epochs')
+    plt.ylabel('mIoU')
+    plt.legend()
+    plt.title('mIoU Curves')
+    plt.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig('training_metrics.png')
+    print("Training metrics visualization saved as 'training_metrics.png'")
+    plt.show()
+    
+    # 输出每个epoch的mIoU数据
+    print("\n训练过程中的每个epoch的mIoU:")
+    for i, (train_iou, val_iou) in enumerate(zip(train_ious, val_ious), 1):
+        print(f"Epoch {i}: Train mIoU = {train_iou:.6f}, Validation mIoU = {val_iou:.6f}")
     
     # 加载最佳模型进行可视化
     print("\nLoading best model for visualization...")
