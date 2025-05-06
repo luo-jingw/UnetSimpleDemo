@@ -1,222 +1,625 @@
-# train_unetpp_voc.py
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
 # ---------------------------------------------------------
-# UNet++ on PASCAL‑VOC 2012 语义分割 (改进版)
-# 关键改动：
-#   1.  LR = 1e‑2 + 5 epoch linear warm‑up → cosine
-#   2.  BatchNorm → GroupNorm(8) (bs = 8 更稳定)
-#   3.  CE 按 VOC 像素统计加权，DiceLoss 保留
-#   4.  深监督：x0_1 / x0_2 / x0_3 各接 1×1 aux‑head
-#   5.  AMP API 更新：torch.amp.*
+# UNet++ on PASCAL-VOC 2012 Semantic Segmentation - Training Script
 # ---------------------------------------------------------
-import os, random, torch, numpy as np
-from PIL import Image
-from torchvision.datasets import VOCSegmentation
-from torchvision import transforms
-from torch.utils.data import DataLoader
+import os
+import random
+import time
+import argparse
+from datetime import datetime
+import numpy as np
+import torch
 import torch.nn as nn
+import torch.optim as optim
 import torch.nn.functional as F
-from torchmetrics.classification import MulticlassJaccardIndex
+from torch.utils.data import DataLoader
+import matplotlib.pyplot as plt
+import cv2
+from torchmetrics.classification import MulticlassJaccardIndex  # IoU calculation
+from tqdm import tqdm
+import logging
 
-torch.backends.cudnn.benchmark = True
+# Import custom network and dataset
+from UnetppModel import UNetPlusPlus
+from DatasetVoc2012 import VOC2012Dataset, VOC_COLORMAP, VOC_CLASSES
 
-# ------------------------------ Blocks ------------------------------
-def gn(ch):        # GroupNorm wrapper
-    return nn.GroupNorm(8, ch)
-
-class ConvBlock(nn.Module):
-    def __init__(self, in_ch, out_ch):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
-            gn(out_ch),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
-            gn(out_ch),
-            nn.ReLU(inplace=True)
-        )
-    def forward(self, x): return self.conv(x)
-
-# ------------------------------ UNet++ ------------------------------
-class UNetPlusPlus(nn.Module):
-    def __init__(self, in_channels=3, num_classes=21):
-        super().__init__()
-        ch = [64,128,256,512]
-
-        self.enc = nn.ModuleList([
-            ConvBlock(in_channels, ch[0]),
-            ConvBlock(ch[0],      ch[1]),
-            ConvBlock(ch[1],      ch[2]),
-            ConvBlock(ch[2],      ch[3]),
-        ])
-        self.pool = nn.MaxPool2d(2)
-        self.up   = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-
-        self.dec01 = ConvBlock(ch[0]+ch[1],   ch[0])
-        self.dec11 = ConvBlock(ch[1]+ch[2],   ch[1])
-        self.dec21 = ConvBlock(ch[2]+ch[3],   ch[2])
-
-        self.dec02 = ConvBlock(ch[0]*2+ch[1], ch[0])
-        self.dec12 = ConvBlock(ch[1]*2+ch[2], ch[1])
-
-        self.dec03 = ConvBlock(ch[0]*3+ch[1], ch[0])
-
-        # heads
-        self.head0 = nn.Conv2d(ch[0], num_classes, 1)   # main (x0_3)
-        self.head1 = nn.Conv2d(ch[0], num_classes, 1)   # aux  (x0_2)
-        self.head2 = nn.Conv2d(ch[0], num_classes, 1)   # aux  (x0_1)
-
-    def forward(self, x):
-        e0 = self.enc[0](x)
-        e1 = self.enc[1](self.pool(e0))
-        e2 = self.enc[2](self.pool(e1))
-        e3 = self.enc[3](self.pool(e2))
-
-        d01 = self.dec01(torch.cat([e0, self.up(e1)], 1))
-        d11 = self.dec11(torch.cat([e1, self.up(e2)], 1))
-        d21 = self.dec21(torch.cat([e2, self.up(e3)], 1))
-
-        d02 = self.dec02(torch.cat([e0, d01, self.up(d11)], 1))
-        d12 = self.dec12(torch.cat([e1, d11, self.up(d21)], 1))
-
-        d03 = self.dec03(torch.cat([e0, d01, d02, self.up(d12)], 1))
-
-        out0 = self.head0(d03)         # H/1
-        out1 = self.head1(d02)         # deep‑sup
-        out2 = self.head2(d01)
-        return out0, out1, out2
-
-# ------------------------------ Losses ------------------------------
-def dice_loss(logits, targets, eps=1e-6, weight=None):
-    C = logits.shape[1]
-    p = torch.softmax(logits, 1)
-    y = F.one_hot(targets.clamp(0, C-1), C).permute(0,3,1,2).float()
-    inter = (p*y).sum((0,2,3))
-    union = p.sum((0,2,3)) + y.sum((0,2,3))
-    if weight is None: weight = torch.ones_like(inter)
-    return (1 - (2*inter + eps)/(union + eps) * weight).mean()
+# ------------------------------ Logger Configuration ------------------------------
+def setup_logger(log_dir):
+    """Configure logger"""
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f'training_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
+    
+    # Create log format
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler()
+        ]
+    )
+    return logging.getLogger()
 
 # ------------------------------ Utils ------------------------------
 def seed_all(seed=42):
-    random.seed(seed); np.random.seed(seed)
-    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+    """Set random seed for reproducibility"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
-# ------------------------------ Main ------------------------------
-def main():
-    seed_all()
-    root, epochs, bs = 'voc_data', 120, 8
-    base_lr, n_cls, out_dir = 1e-2, 21, 'checkpoints'
-    accum, clip, use_amp = 4, 1.0, True
-    os.makedirs(out_dir, exist_ok=True)
+# Convert segmentation mask to RGB color image
+def decode_segmap(mask):
+    """
+    Convert segmentation mask to RGB color image
+    mask: [H, W] tensor containing class indices 0-20
+    returns: [H, W, 3] numpy array, RGB color image
+    """
+    if isinstance(mask, torch.Tensor):
+        mask = mask.detach().cpu().numpy()
+    h, w = mask.shape
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    
+    for cls in range(21):
+        rgb[mask == cls] = VOC_COLORMAP[cls]
+            
+    return rgb
 
-    tf_common = dict(size=512, scale=(0.5,2.0))
-    img_tf = transforms.Compose([
-        transforms.RandomResizedCrop(**tf_common),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor()])
-    msk_tf = transforms.Compose([
-        transforms.RandomResizedCrop(interpolation=Image.NEAREST, **tf_common),
-        transforms.RandomHorizontalFlip(),
-        transforms.PILToTensor()])
-    val_img_tf = transforms.Compose([
-        transforms.Resize(544), transforms.CenterCrop(512), transforms.ToTensor()])
-    val_msk_tf = transforms.Compose([
-        transforms.Resize(544, interpolation=Image.NEAREST),
-        transforms.CenterCrop(512), transforms.PILToTensor()])
+# ------------------------------ Loss Functions ------------------------------
+# Calculate cross entropy loss, ignoring pixels with label 255
+def cross_entropy_loss(pred, target, weights=None):
+    """Cross entropy loss with class weights"""
+    # Ensure target mask is Long type
+    if target.dtype != torch.long:
+        target = target.long()
+    return F.cross_entropy(pred, target, weight=weights, ignore_index=255, reduction='mean')
 
-    train_ds = VOCSegmentation(root, '2012', 'train', True, img_tf, msk_tf)
-    val_ds   = VOCSegmentation(root, '2012', 'val',   False, val_img_tf, val_msk_tf)
+# Dice Loss implementation
+def dice_loss(pred, target, smooth=1.0):
+    """Dice loss function"""
+    # Ensure target is Long type
+    if target.dtype != torch.long:
+        target = target.long()
+        
+    pred = F.softmax(pred, dim=1)
+    
+    # Ignore 255 labels (boundary regions)
+    valid_mask = (target != 255)
+    target = target * valid_mask
+    
+    # One-hot encoding
+    target_one_hot = torch.zeros_like(pred)
+    target_one_hot.scatter_(1, target.unsqueeze(1), 1)
+    
+    # Calculate Dice coefficient
+    intersection = (pred * target_one_hot).sum(dim=(2, 3))
+    union = pred.sum(dim=(2, 3)) + target_one_hot.sum(dim=(2, 3))
+    dice = (2. * intersection + smooth) / (union + smooth)
+    
+    return 1 - dice.mean()
 
+# Combined loss function
+def combined_loss(pred, target, weights=None, dice_weight=0.5):
+    """Combine cross entropy and Dice loss"""
+    ce_loss = cross_entropy_loss(pred, target, weights)
+    dc_loss = dice_loss(pred, target)
+    return ce_loss + dice_weight * dc_loss
+
+# ------------------------------ Training Function ------------------------------
+def train_one_epoch(model, train_loader, optimizer, device, epoch, logger, class_weights=None):
+    """Train for one epoch"""
+    model.train()
+    total_loss = 0
+    batch_count = len(train_loader)
+    start_time = time.time()
+    
+    # Calculate IoU metric
+    miou = MulticlassJaccardIndex(num_classes=21, ignore_index=255).to(device)
+    iou_score = 0
+    
+    # Use tqdm to display progress bar
+    pbar = tqdm(train_loader, desc=f'Epoch {epoch} Training')
+    
+    for batch_idx, (data, target) in enumerate(pbar):
+        # Move data to device
+        data, target = data.to(device), target.to(device)
+        
+        # Clear gradients
+        optimizer.zero_grad()
+        
+        # Forward pass - using deep supervision
+        output0, output1, output2 = model(data)
+        
+        # Calculate loss - main output and auxiliary outputs
+        main_loss = combined_loss(output0, target, class_weights, dice_weight=0.5)
+        aux1_loss = cross_entropy_loss(output1, target, class_weights)
+        aux2_loss = cross_entropy_loss(output2, target, class_weights)
+        
+        # Combined loss
+        loss = main_loss + 0.4 * aux1_loss + 0.2 * aux2_loss
+        
+        # Backward pass
+        loss.backward()
+        
+        # Update parameters
+        optimizer.step()
+        
+        # Accumulate loss
+        total_loss += loss.item()
+        
+        # Calculate IoU during training (using main output)
+        with torch.no_grad():
+            pred = output0.argmax(dim=1)
+            iou_score += miou(pred, target)
+        
+        # Update progress bar info
+        pbar.set_postfix({'Loss': f'{loss.item():.4f}'})
+        
+    # Calculate average loss and training time
+    avg_loss = total_loss / batch_count
+    avg_iou = iou_score / batch_count
+    epoch_time = time.time() - start_time
+    
+    # Log information
+    logger.info(f'Train Epoch: {epoch}, Average Loss: {avg_loss:.6f}, mIoU: {avg_iou:.6f}, Time: {epoch_time:.2f}s')
+    
+    return avg_loss, avg_iou
+
+# ------------------------------ Validation Function ------------------------------
+def validate(model, val_loader, device, logger, class_weights=None):
+    """Validate the model"""
+    model.eval()
+    val_loss = 0
+    miou = MulticlassJaccardIndex(num_classes=21, ignore_index=255).to(device)
+    iou_score = 0
+    batch_count = len(val_loader)
+    
+    # Use tqdm to display progress bar
+    pbar = tqdm(val_loader, desc='Validation')
+    
+    with torch.no_grad():
+        for data, target in pbar:
+            data, target = data.to(device), target.to(device)
+            
+            # Forward pass
+            output0, _, _ = model(data)
+            
+            # Calculate loss
+            loss = combined_loss(output0, target, class_weights, dice_weight=0.5)
+            val_loss += loss.item()
+            
+            # Calculate IoU
+            pred = output0.argmax(dim=1)
+            iou_score += miou(pred, target)
+            
+            # Update progress bar info
+            pbar.set_postfix({'Loss': f'{loss.item():.4f}'})
+    
+    # Calculate average loss and IoU
+    avg_loss = val_loss / batch_count
+    avg_iou = iou_score / batch_count
+    
+    # Log information
+    logger.info(f'Validation: Average Loss: {avg_loss:.6f}, mIoU: {avg_iou:.6f}')
+    
+    return avg_loss, avg_iou
+
+# ------------------------------ Visualize Predictions ------------------------------
+def visualize_predictions(model, val_loader, device, output_dir, epoch, num_samples=3):
+    """Visualize model predictions"""
+    model.eval()
+    
+    # Ensure output directory exists
+    os.makedirs(output_dir, exist_ok=True)
+    
+    fig, axes = plt.subplots(num_samples, 3, figsize=(15, 5*num_samples))
+    
+    with torch.no_grad():
+        # Get specified number of samples
+        for i, (images, masks) in enumerate(val_loader):
+            if i >= num_samples:
+                break
+                
+            # Get the first sample in a batch
+            image = images[0:1].to(device)
+            mask = masks[0].cpu()
+            
+            # Model prediction
+            outputs, _, _ = model(image)
+            
+            # Check original output statistics
+            print(f"\nSample {i+1} prediction statistics:")
+            print(f"Output tensor shape: {outputs.shape}")
+            print(f"Output min value: {outputs.min().item():.4f}, max value: {outputs.max().item():.4f}")
+            print(f"Output mean: {outputs.mean().item():.4f}, std: {outputs.std().item():.4f}")
+            
+            # Apply softmax to output
+            probs = F.softmax(outputs[0], dim=0)
+            
+            # Get maximum probability for each class
+            max_probs, _ = torch.max(probs, dim=0)
+            
+            # Get predicted class
+            pred = outputs[0].argmax(0).cpu()
+            
+            # Print predicted class distribution
+            unique_classes, counts = np.unique(pred.numpy(), return_counts=True)
+            print(f"Predicted class distribution: {list(zip(unique_classes, counts))}")
+            
+            # Convert to visualization format
+            img_np = images[0].permute(1, 2, 0).numpy()
+            img_np = (img_np * 255).astype(np.uint8)
+            
+            # In VOC masks, 255 represents ignore regions, set to 0 (background) for display
+            mask_vis = mask.clone()
+            mask_vis[mask_vis == 255] = 0
+            
+            # Convert to color images
+            gt_color = decode_segmap(mask_vis)
+            pred_color = decode_segmap(pred)
+            
+            # Display original image
+            axes[i, 0].imshow(img_np)
+            axes[i, 0].set_title("Original Image")
+            axes[i, 0].axis('off')
+            
+            # Display ground truth mask
+            axes[i, 1].imshow(gt_color)
+            axes[i, 1].set_title("Ground Truth")
+            axes[i, 1].axis('off')
+            
+            # Display predicted mask
+            axes[i, 2].imshow(pred_color)
+            axes[i, 2].set_title("Prediction")
+            axes[i, 2].axis('off')
+            
+            # Output class information
+            gt_classes = [VOC_CLASSES[cls] for cls in torch.unique(mask_vis).numpy() if cls < 21]
+            pred_classes = [VOC_CLASSES[cls] for cls in torch.unique(pred).numpy() if cls < 21]
+            print(f"Ground Truth classes: {', '.join(gt_classes)}")
+            print(f"Predicted classes: {', '.join(pred_classes)}")
+            
+            # Save prediction confidence map
+            plt.figure(figsize=(8, 6))
+            plt.imshow(max_probs.cpu().numpy(), cmap='hot')
+            plt.colorbar(label='Confidence')
+            plt.title(f"Sample {i+1} Prediction Confidence")
+            plt.savefig(os.path.join(output_dir, f'confidence_epoch{epoch}_sample{i+1}.png'))
+            plt.close()
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f'predictions_epoch{epoch}.png'))
+    print(f"Prediction visualization saved for epoch {epoch}")
+    plt.close()
+
+# ------------------------------ Model Training Main Function ------------------------------
+def train(args):
+    """Main function for model training"""
+    # Set random seed
+    seed_all(args.seed)
+    
+    # Set up logger
+    logger = setup_logger(args.log_dir)
+    logger.info(f"Starting training with config: {args}")
+    
+    # Create output directories
+    os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    os.makedirs(args.vis_dir, exist_ok=True)
+    
+    # Choose device
+    device = torch.device('cuda' if torch.cuda.is_available() and not args.no_cuda else 'cpu')
+    logger.info(f"Using device: {device}")
+    
+    # Create datasets
+    logger.info("Loading datasets...")
+    train_ds = VOC2012Dataset(root=args.data_root, split='train', img_size=args.img_size)
+    val_ds = VOC2012Dataset(root=args.data_root, split='val', img_size=args.img_size)
+    
+    logger.info(f"Training set: {len(train_ds)} samples")
+    logger.info(f"Validation set: {len(val_ds)} samples")
+    
+    # Create data loaders
     train_loader = DataLoader(
-    train_ds,
-    batch_size=bs,
-    shuffle=True,
-    num_workers=4,               
-    pin_memory=True,
-    persistent_workers=True,
-    prefetch_factor=4
+        train_ds, 
+        batch_size=args.batch_size, 
+        shuffle=True, 
+        num_workers=args.num_workers, 
+        pin_memory=True
     )
-
     val_loader = DataLoader(
-    val_ds,
-    batch_size=bs,
-    shuffle=False,
-    num_workers=4,                
-    pin_memory=True,
-    persistent_workers=True
+        val_ds, 
+        batch_size=args.batch_size, 
+        shuffle=False, 
+        num_workers=args.num_workers, 
+        pin_memory=True
     )
+    
+    # Create model
+    logger.info("Initializing UNet++ model...")
+    model = UNetPlusPlus(
+        in_channels=3, 
+        num_classes=21, 
+        deep_supervision=True
+    ).to(device)
+    
+    # Print model structure and parameter count
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"Model parameter count: {total_params:,}")
+    
+    # Set up class weights (optional)
+    if args.use_class_weights:
+        # Give background lower weight
+        class_weights = torch.ones(21).to(device)
+        class_weights[0] = 0.5  # Lower background weight
+        logger.info("Using class weights, background weight reduced to 0.5")
+    else:
+        class_weights = None
+    
+    # Define optimizer and learning rate scheduler
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    
+    if args.scheduler == 'cosine':
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr)
+        logger.info(f"Using cosine annealing scheduler, initial lr={args.lr}, min lr={args.min_lr}")
+    elif args.scheduler == 'step':
+        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.step_size, gamma=args.gamma)
+        logger.info(f"Using step scheduler, reducing by factor {args.gamma} every {args.step_size} epochs")
+    else:
+        scheduler = None
+        logger.info(f"Using fixed learning rate: {args.lr}")
+    
+    # Resume training (if checkpoint specified)
+    start_epoch = 1
+    best_iou = 0.0
+    
+    if args.resume:
+        if os.path.isfile(args.resume):
+            logger.info(f"Loading checkpoint: {args.resume}")
+            checkpoint = torch.load(args.resume)
+            model.load_state_dict(checkpoint['model'])
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            if scheduler and 'scheduler' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler'])
+            start_epoch = checkpoint['epoch'] + 1
+            best_iou = checkpoint['best_iou']
+            logger.info(f"Resuming from epoch {start_epoch}, best mIoU: {best_iou:.6f}")
+        else:
+            logger.warning(f"Checkpoint not found: {args.resume}")
+    
+    # Visualize some training samples
+    logger.info("Visualizing training samples...")
+    sample_batch = next(iter(train_loader))
+    sample_images, sample_masks = sample_batch
+    
+    plt.figure(figsize=(15, 10))
+    for i in range(min(4, len(sample_images))):
+        # Convert to NumPy arrays
+        img = sample_images[i].permute(1, 2, 0).numpy()
+        img = (img * 255).astype(np.uint8)
+        
+        mask = sample_masks[i].clone()
+        # Set 255 (ignore regions) to 0 (background) for visualization
+        mask[mask == 255] = 0
+        color_mask = decode_segmap(mask)
+        
+        # Create semi-transparent overlay
+        overlay = cv2.addWeighted(color_mask, 0.4, img, 0.6, 0)
+        
+        # Display images
+        plt.subplot(2, 4, i+1)
+        plt.title(f"Image {i+1}")
+        plt.imshow(img)
+        plt.axis('off')
+        
+        plt.subplot(2, 4, i+5)
+        plt.title(f"Mask {i+1}")
+        plt.imshow(overlay)
+        plt.axis('off')
+    
+    plt.savefig(os.path.join(args.output_dir, 'training_samples.png'))
+    logger.info("Training sample visualization saved")
+    plt.close()
+    
+    # Training loop
+    logger.info(f"Starting training for {args.epochs} epochs...")
+    train_losses = []
+    train_ious = []
+    val_losses = []
+    val_ious = []
+    
+    for epoch in range(start_epoch, args.epochs + 1):
+        logger.info(f"\n===== Epoch {epoch}/{args.epochs} =====")
+        
+        # Train for one epoch
+        train_loss, train_iou = train_one_epoch(
+            model, train_loader, optimizer, device, epoch, logger, class_weights
+        )
+        train_losses.append(train_loss)
+        train_ious.append(train_iou.cpu().item() if isinstance(train_iou, torch.Tensor) else train_iou)
+        
+        # Validate
+        val_loss, val_iou = validate(model, val_loader, device, logger, class_weights)
+        val_losses.append(val_loss)
+        val_ious.append(val_iou.cpu().item() if isinstance(val_iou, torch.Tensor) else val_iou)
+        
+        # Learning rate scheduling
+        if scheduler:
+            scheduler.step()
+            current_lr = scheduler.get_last_lr()[0]
+            logger.info(f"Current learning rate: {current_lr:.6f}")
+        
+        # Save epoch checkpoint
+        checkpoint_path = os.path.join(args.checkpoint_dir, f'epoch{epoch}.pt')
+        torch.save({
+            'epoch': epoch,
+            'model': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict() if scheduler else None,
+            'best_iou': best_iou,
+            'train_loss': train_loss,
+            'train_iou': train_iou,
+            'val_loss': val_loss,
+            'val_iou': val_iou
+        }, checkpoint_path)
+        logger.info(f"Saved epoch {epoch} checkpoint: {checkpoint_path}")
+        
+        # Save best model
+        current_iou = val_iou.cpu().item() if isinstance(val_iou, torch.Tensor) else val_iou
+        if current_iou > best_iou:
+            best_iou = current_iou
+            best_path = os.path.join(args.checkpoint_dir, 'best.pt')
+            torch.save({
+                'epoch': epoch,
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict() if scheduler else None,
+                'best_iou': best_iou,
+                'train_loss': train_loss,
+                'train_iou': train_iou,
+                'val_loss': val_loss,
+                'val_iou': val_iou
+            }, best_path)
+            logger.info(f"Found new best model! mIoU: {best_iou:.6f}, saved to {best_path}")
+        
+        # Plot current training progress
+        if epoch % args.vis_freq == 0 or epoch == args.epochs:
+            # Plot loss and IoU curves
+            plt.figure(figsize=(15, 5))
+            
+            # Loss curves
+            plt.subplot(1, 2, 1)
+            epochs_range = list(range(start_epoch, start_epoch + len(train_losses)))
+            plt.plot(epochs_range, train_losses, 'b-', label='Training Loss')
+            plt.plot(epochs_range, val_losses, 'r-', label='Validation Loss')
+            plt.xlabel('Epochs')
+            plt.ylabel('Loss')
+            plt.legend()
+            plt.title('Loss Curves')
+            plt.grid(True)
+            
+            # IoU curves
+            plt.subplot(1, 2, 2)
+            plt.plot(epochs_range, train_ious, 'b-', label='Training mIoU')
+            plt.plot(epochs_range, val_ious, 'r-', label='Validation mIoU')
+            plt.xlabel('Epochs')
+            plt.ylabel('mIoU')
+            plt.legend()
+            plt.title('mIoU Curves')
+            plt.grid(True)
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(args.output_dir, f'training_metrics_epoch{epoch}.png'))
+            logger.info(f"Training metrics visualization saved (epoch {epoch})")
+            plt.close()
+            
+            # Visualize prediction results
+            logger.info(f"Generating prediction visualizations for epoch {epoch}...")
+            visualize_predictions(
+                model, val_loader, device, args.vis_dir, epoch, num_samples=args.vis_samples
+            )
+    
+    # Plot complete training curves
+    plt.figure(figsize=(15, 5))
+    
+    # Loss curve
+    plt.subplot(1, 2, 1)
+    epochs_range = list(range(start_epoch, start_epoch + len(train_losses)))
+    plt.plot(epochs_range, train_losses, 'b-', label='Training Loss')
+    plt.plot(epochs_range, val_losses, 'r-', label='Validation Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.title('Loss Curves')
+    plt.grid(True)
+    
+    # IoU curve
+    plt.subplot(1, 2, 2)
+    plt.plot(epochs_range, train_ious, 'b-', label='Training mIoU')
+    plt.plot(epochs_range, val_ious, 'r-', label='Validation mIoU')
+    plt.xlabel('Epochs')
+    plt.ylabel('mIoU')
+    plt.legend()
+    plt.title('mIoU Curves')
+    plt.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(args.output_dir, 'final_training_metrics.png'))
+    logger.info("Final training metrics visualization saved")
+    plt.close()
+    
+    # Output mIoU data for each epoch
+    logger.info("\nmIoU for each epoch during training:")
+    for i, (t_iou, v_iou) in enumerate(zip(train_ious, val_ious), start_epoch):
+        logger.info(f"Epoch {i}: Train mIoU = {t_iou:.6f}, Validation mIoU = {v_iou:.6f}")
+    
+    # Save final model (not best model)
+    final_model_path = os.path.join(args.output_dir, 'unetpp_voc2012_final.pt')
+    torch.save(model.state_dict(), final_model_path)
+    logger.info(f"Training complete! Final model saved to: {final_model_path}")
+    logger.info(f"Best mIoU: {best_iou:.6f}")
+    
+    # Load best model for final visualization
+    logger.info("\nLoading best model for final visualization...")
+    best_checkpoint = torch.load(os.path.join(args.checkpoint_dir, 'best.pt'))
+    model.load_state_dict(best_checkpoint['model'])
+    best_epoch = best_checkpoint['epoch']
+    logger.info(f"load best model from epoch {best_epoch}")
+    
+    # Generate visualizations for the best model
+    visualize_predictions(
+        model, val_loader, device, args.vis_dir, 'best', num_samples=args.vis_samples
+    )
+    logger.info("Best model visualizations saved")
+    
+    return {
+        'best_iou': best_iou,
+        'best_epoch': best_epoch,
+        'final_train_iou': train_ious[-1],
+        'final_val_iou': val_ious[-1],
+    }
 
-    dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    net = UNetPlusPlus(num_classes=n_cls).to(dev)
+# ------------------------------ Main Function ------------------------------
+def parse_args():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(description='UNet++ Semantic Segmentation Training Script')
+    
+    # Dataset parameters
+    parser.add_argument('--data-root', default='voc_data', type=str, help='Path to dataset')
+    parser.add_argument('--img-size', default=512, type=int, help='Image size')
+    
+    # Training parameters
+    parser.add_argument('--batch-size', default=8, type=int, help='Training batch size')
+    parser.add_argument('--epochs', default=200, type=int, help='Number of training epochs')
+    parser.add_argument('--lr', default=1e-1, type=float, help='Initial learning rate')
+    parser.add_argument('--min-lr', default=1e-5, type=float, help='Minimum learning rate')
+    parser.add_argument('--weight-decay', default=1e-4, type=float, help='Weight decay')
+    parser.add_argument('--num-workers', default=6, type=int, help='Number of data loading workers')
+    parser.add_argument('--scheduler', default='cosine', choices=['cosine', 'step', 'none'], 
+                        help='Learning rate scheduler type')
+    parser.add_argument('--step-size', default=10, type=int, help='Step size for step scheduler')
+    parser.add_argument('--gamma', default=0.1, type=float, help='Decay rate for step scheduler')
+    parser.add_argument('--use-class-weights', action='store_true', help='Use class weights')
+    parser.add_argument('--seed', default=42, type=int, help='Random seed')
+    parser.add_argument('--no-cuda', action='store_true', help='Disable CUDA')
+    
+    # Training control parameters
+    parser.add_argument('--resume', default='', type=str, help='Path to checkpoint to resume training')
+    parser.add_argument('--vis-freq', default=5, type=int, help='Visualization frequency (epoch)')
+    parser.add_argument('--vis-samples', default=3, type=int, help='Number of samples to visualize each time')
+    
+    # Output parameters
+    parser.add_argument('--output-dir', default='output', type=str, help='Output directory')
+    parser.add_argument('--checkpoint-dir', default='checkpoints', type=str, help='Checkpoint save directory')
+    parser.add_argument('--vis-dir', default='visualizations', type=str, help='Visualization output directory')
+    parser.add_argument('--log-dir', default='logs', type=str, help='Log save directory')
+    
+    return parser.parse_args()
 
-    # ---------- class weights ----------
-    # 像素频率统计值（预先离线算好，顺序与 VOC label 对应，最后一位背景）
-    cls_freq = torch.tensor([
-        0.048,0.007,0.010,0.009,0.008,0.005,0.012,0.004,0.003,0.007,
-        0.002,0.009,0.005,0.004,0.002,0.003,0.003,0.004,0.002,0.002,
-        0.859                             # background
-    ])
-    ce_weight = 1 / torch.log1p(1.02*cls_freq)
-
-    loss_ce = nn.CrossEntropyLoss(ignore_index=255,
-                                  weight=ce_weight.to(dev))
-
-    opt = torch.optim.SGD(net.parameters(), base_lr,
-                          momentum=0.9, weight_decay=1e-4)
-
-    warm  = torch.optim.lr_scheduler.LinearLR(opt, start_factor=0.1, total_iters=5)
-    cos   = torch.optim.lr_scheduler.CosineAnnealingLR(opt, epochs-5, eta_min=1e-5)
-    sched = torch.optim.lr_scheduler.SequentialLR(opt, [warm, cos], [5])
-
-    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
-    miou   = MulticlassJaccardIndex(num_classes=n_cls, ignore_index=255).to(dev)
-
-    best = 0.
-    for ep in range(1, epochs+1):
-        net.train(); opt.zero_grad(set_to_none=True); run_loss = 0.
-        for it,(img,mask) in enumerate(train_loader,1):
-            img = img.to(dev,non_blocking=True)
-            mask= mask.squeeze(1).long().to(dev,non_blocking=True)
-
-            with torch.amp.autocast('cuda', dtype=torch.float16, enabled=use_amp):
-                o0,o1,o2 = net(img)
-                main = loss_ce(o0,mask)+0.5*dice_loss(o0,mask)
-                aux1 = loss_ce(o1,mask)
-                aux2 = loss_ce(o2,mask)
-                loss = main + 0.4*aux1 + 0.2*aux2
-
-            scaler.scale(loss/accum).backward()
-            if it%accum==0 or it==len(train_loader):
-                scaler.unscale_(opt)
-                torch.nn.utils.clip_grad_norm_(net.parameters(), clip)
-                scaler.step(opt); scaler.update(); opt.zero_grad(set_to_none=True)
-            run_loss += loss.item()*img.size(0)
-
-        sched.step()
-        train_loss = run_loss/len(train_loader.dataset)
-
-        # ---------------- validation ----------------
-        net.eval(); v_loss=0.; v_iou=0.
-        with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.float16,
-                                                 enabled=use_amp):
-            for img,mask in val_loader:
-                img = img.to(dev,non_blocking=True)
-                mask= mask.squeeze(1).long().to(dev,non_blocking=True)
-                o0,_,_ = net(img)
-                v_loss += (loss_ce(o0,mask)+0.5*dice_loss(o0,mask)).item()*img.size(0)
-                v_iou  += miou(o0.argmax(1),mask)*img.size(0)
-        v_loss/=len(val_loader.dataset); v_miou=v_iou/len(val_loader.dataset)
-
-        print(f"[{ep:03}/{epochs}]"
-              f" train {train_loss:.3f}  val {v_loss:.3f}"
-              f"  mIoU {v_miou:.3f}  lr {sched.get_last_lr()[0]:.5f}")
-
-        torch.save({'epoch':ep,'model':net.state_dict()}, os.path.join(out_dir,'latest.pt'))
-        if v_miou>best:
-            best=v_miou
-            torch.save(net.state_dict(), os.path.join(out_dir,'best.pt'))
-
-    torch.save(net.state_dict(), 'unetpp_voc2012_final.pt')
-    print(f"Finished; best mIoU={best:.3f}")
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    args = parse_args()
+    results = train(args)
+    print(f"Training complete! Best mIoU: {results['best_iou']:.6f} (Epoch {results['best_epoch']})")

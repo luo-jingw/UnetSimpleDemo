@@ -42,12 +42,12 @@
   <h2>UNet++ Segmentation Demo</h2>
 
   <div id="upload-box">
-    拖入或点击上传图片<br>
+    Drag and drop or click to upload image<br>
     <input type="file" id="fileInput" accept="image/*" style="display:none">
   </div>
 
   <div id="controls" style="display:none">
-    <label for="categorySelect">选择类别：</label>
+    <label for="categorySelect">Select category:</label>
     <select id="categorySelect"></select>
   </div>
 
@@ -57,7 +57,7 @@
   </div>
 
   <script>
-    // VOC 2012 类别映射
+    // VOC 2012 class mapping
     const VOC_CLASSES = [
       'background','aeroplane','bicycle','bird','boat',
       'bottle','bus','car','cat','chair',
@@ -76,7 +76,7 @@
     let maskData = null;
     let imgWidth = 0, imgHeight = 0;
 
-    // 填充类别下拉
+    // Fill category dropdown
     VOC_CLASSES.forEach((name, idx) => {
       const opt = document.createElement('option');
       opt.value = idx;
@@ -84,7 +84,7 @@
       categorySelect.appendChild(opt);
     });
 
-    // 事件绑定
+    // Event binding
     uploadBox.addEventListener('click', () => fileInput.click());
     uploadBox.addEventListener('dragover', e => {
       e.preventDefault();
@@ -119,16 +119,16 @@
         cv.width  = imgWidth;
         cv.height = imgHeight;
       });
-      // 画原图
+      // Draw original image
       const ctx = imageCanvas.getContext('2d');
       ctx.clearRect(0, 0, imgWidth, imgHeight);
       ctx.drawImage(img, 0, 0, imgWidth, imgHeight);
 
-      // 显示控件
+      // Show controls
       controls.style.display = 'block';
       canvasContainer.style.display = 'inline-block';
 
-      // 发送到后端
+      // Send to backend
       sendToBackend();
     }
 
@@ -139,15 +139,15 @@
         fetch('http://127.0.0.1:8000/predict', { method: 'POST', body: form })
           .then(res => res.json())
           .then(json => {
-            maskData = json.mask;  // 期待 mask: [w*h] 的扁平数组
-            // 验证掩码数据是否为空或全为0/1种类别
+            maskData = json.mask;  // Expect mask: [w*h] flat array
+            // Validate if mask data is empty or contains only one category
             const uniqueValues = new Set(maskData);
-            console.log("掩码中的唯一值:", Array.from(uniqueValues));
+            console.log("Unique values in mask:", Array.from(uniqueValues));
             drawMask();
           })
           .catch(err => {
-            console.error('预测失败', err);
-            alert('模型推理失败，请检查后端 /predict 接口');
+            console.error('Prediction failed', err);
+            alert('Model inference failed, please check the backend /predict endpoint');
           });
       });
     }

@@ -8,7 +8,7 @@ from torchvision.datasets import VOCSegmentation
 import cv2  
 import matplotlib.pyplot as plt
 
-# VOC数据集标签颜色映射（21类，包括背景）
+# VOC dataset label color mapping (21 classes, including background)
 VOC_COLORMAP = [
     [0, 0, 0],        # background
     [128, 0, 0],      # aeroplane
@@ -33,7 +33,7 @@ VOC_COLORMAP = [
     [0, 64, 128]      # tvmonitor
 ]
 
-# VOC标签名称
+# VOC label names
 VOC_CLASSES = [
     'background', 'aeroplane', 'bicycle', 'bird', 'boat', 'bottle', 'bus',
     'car', 'cat', 'chair', 'cow', 'diningtable', 'dog', 'horse',
@@ -42,34 +42,34 @@ VOC_CLASSES = [
 
 class VOC2012Dataset(Dataset):
     """
-    VOC2012数据集加载类，移除数据增强以确保图像和掩码正确对齐
+    VOC2012 dataset loading class, removing data augmentation to ensure proper alignment of images and masks
     """
     
     def __init__(self, root='voc_data', split='train', transform=None, target_transform=None, 
                  img_size=512):
         """
-        初始化VOC2012数据集
+        Initialize VOC2012 dataset
         
-        参数:
-            root: 数据集根目录
-            split: 'train', 'val' 或 'trainval'
-            transform: 图像变换函数
-            target_transform: 标签变换函数
-            img_size: 输出图像尺寸
+        Parameters:
+            root: Dataset root directory
+            split: 'train', 'val' or 'trainval'
+            transform: Image transformation function
+            target_transform: Label transformation function
+            img_size: Output image size
         """
-        # 设置图像变换
+        # Set image transformations
         if transform is None:
-            # 标准变换，无数据增强
+            # Standard transformation, no data augmentation
             self.img_transform = transforms.Compose([
-                transforms.Resize((img_size, img_size)),  # 使用固定尺寸确保一致
+                transforms.Resize((img_size, img_size)),  # Use fixed size to ensure consistency
                 transforms.ToTensor(),
             ])
         else:
             self.img_transform = transform
             
-        # 设置掩码变换
+        # Set mask transformations
         if target_transform is None:
-            # 掩码变换需与图像变换保持一致
+            # Mask transformation should be consistent with image transformation
             self.mask_transform = transforms.Compose([
                 transforms.Resize((img_size, img_size), interpolation=Image.NEAREST),
                 transforms.PILToTensor(),
@@ -77,7 +77,7 @@ class VOC2012Dataset(Dataset):
         else:
             self.mask_transform = target_transform
             
-        # 初始化基础VOCSegmentation数据集
+        # Initialize base VOCSegmentation dataset
         self.dataset = VOCSegmentation(
             root=root, 
             year='2012',
@@ -91,13 +91,13 @@ class VOC2012Dataset(Dataset):
         return len(self.dataset)
     
     def __getitem__(self, idx):
-        """获取数据集中的一个样本"""
+        """Get a sample from the dataset"""
         img, mask = self.dataset[idx]
         
-        # 处理掩码：VOC数据集中255表示忽略区域，我们可以选择处理它
+        # Process mask: In VOC dataset, 255 represents ignored regions, we can choose to process it
         if isinstance(mask, torch.Tensor):
-            mask = mask.squeeze(0)  # 移除通道维度 [1, H, W] -> [H, W]
-            # 可选：将255（忽略区域）设为0（背景）
+            mask = mask.squeeze(0)  # Remove channel dimension [1, H, W] -> [H, W]
+            # Optional: Set 255 (ignore regions) to 0 (background)
             # mask[mask == 255] = 0
         
         return img, mask
@@ -105,9 +105,9 @@ class VOC2012Dataset(Dataset):
     @staticmethod
     def decode_segmap(mask):
         """
-        将分割掩码转换为RGB彩色图像
-        mask: [H, W] 的张量，值为0-20的类别索引
-        返回: [H, W, 3] 的numpy数组，RGB彩色图
+        Convert segmentation mask to RGB color image
+        mask: [H, W] tensor with class indices 0-20
+        returns: [H, W, 3] numpy array, RGB color image
         """
         if isinstance(mask, torch.Tensor):
             mask = mask.numpy()
@@ -123,9 +123,9 @@ class VOC2012Dataset(Dataset):
     @staticmethod
     def get_class_names(mask):
         """
-        获取掩码中存在的类别名称
-        mask: [H, W] 的张量或numpy数组，值为0-20的类别索引
-        返回: 存在的类别名称列表
+        Get class names present in the mask
+        mask: [H, W] tensor or numpy array with class indices 0-20
+        returns: List of present class names
         """
         if isinstance(mask, torch.Tensor):
             unique_classes = torch.unique(mask).numpy()
@@ -134,35 +134,35 @@ class VOC2012Dataset(Dataset):
             
         return [VOC_CLASSES[cls] for cls in unique_classes if cls < 21]
 
-# 使用示例
+# Usage example
 def create_voc_dataloaders(root='voc_data', batch_size=8, img_size=512, num_workers=2):
     """
-    创建VOC2012数据集的训练和验证数据加载器
+    Create training and validation data loaders for VOC2012 dataset
     
-    参数:
-        root: 数据集根目录
-        batch_size: 批量大小
-        img_size: 图像尺寸
-        num_workers: 数据加载线程数
+    Parameters:
+        root: Dataset root directory
+        batch_size: Batch size
+        img_size: Image size
+        num_workers: Number of data loading threads
         
-    返回:
-        train_loader, val_loader: 训练和验证数据加载器
+    Returns:
+        train_loader, val_loader: Training and validation data loaders
     """
-    # 创建训练数据集（不使用数据增强）
+    # Create training dataset (without data augmentation)
     train_ds = VOC2012Dataset(
         root=root,
         split='train',
         img_size=img_size
     )
     
-    # 创建验证数据集
+    # Create validation dataset
     val_ds = VOC2012Dataset(
         root=root,
         split='val',
         img_size=img_size
     )
     
-    # 创建数据加载器
+    # Create data loaders
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
@@ -182,50 +182,50 @@ def create_voc_dataloaders(root='voc_data', batch_size=8, img_size=512, num_work
     
     return train_loader, val_loader
 
-# 测试代码
+# Test code
 if __name__ == "__main__":
     
-    # 创建数据集
+    # Create datasets
     train_ds = VOC2012Dataset(split='train', img_size=512)
     val_ds = VOC2012Dataset(split='val', img_size=512)
     
-    print(f"训练集大小: {len(train_ds)}")
-    print(f"验证集大小: {len(val_ds)}")
+    print(f"Training set size: {len(train_ds)}")
+    print(f"Validation set size: {len(val_ds)}")
     
-    # 可视化几个样本
+    # Visualize several samples
     fig, axes = plt.subplots(3, 3, figsize=(15, 15))
     
     for i in range(3):
         img, mask = val_ds[i]
         
-        # 转换图像格式用于显示
+        # Convert image format for display
         img_np = img.permute(1, 2, 0).numpy()
         img_np = (img_np * 255).astype(np.uint8)
         
-        # 转换掩码为彩色图
+        # Convert mask to color image
         color_mask = VOC2012Dataset.decode_segmap(mask)
         
-        # 创建叠加效果
+        # Create overlay effect
         overlay = cv2.addWeighted(img_np, 0.7, color_mask, 0.3, 0)
         
-        # 显示图像
+        # Display image
         axes[i, 0].imshow(img_np)
         axes[i, 0].set_title("Image")
         axes[i, 0].axis('off')
         
-        # 显示彩色掩码
+        # Display color mask
         axes[i, 1].imshow(color_mask)
         axes[i, 1].set_title("Segmentation Mask")
         axes[i, 1].axis('off')
         
-        # 显示叠加效果
+        # Display overlay effect
         axes[i, 2].imshow(overlay)
         axes[i, 2].set_title("Overlay")
         axes[i, 2].axis('off')
         
-        # 获取并显示类别名称
+        # Get and display class names
         class_names = VOC2012Dataset.get_class_names(mask)
-        print(f"样本 {i+1} 类别: {', '.join(class_names)}")
+        print(f"Sample {i+1} classes: {', '.join(class_names)}")
     
     plt.tight_layout()
     plt.savefig('aligned_samples.png')

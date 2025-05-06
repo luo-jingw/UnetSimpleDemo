@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 from torchvision import transforms
 
-# 定义相同的模型类，确保加载时结构匹配
+# Define model structure to ensure compatibility when loading weights
 class ConvBlock(nn.Module):
     def __init__(self, in_ch, out_ch):
         super().__init__()
@@ -74,7 +74,7 @@ class UNetPlusPlus(nn.Module):
         # Output
         return self.final(x0_3)
 
-# 1. 创建 FastAPI 应用并开启 CORS
+# 1. Create FastAPI application and enable CORS
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -83,52 +83,52 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 2. 加载自定义模型的权重
+# 2. Load custom model weights
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = UNetPlusPlus(in_channels=3, num_classes=21)
 try:
-    # 添加 weights_only=True 以消除警告
+    # Add weights_only=True to eliminate warnings
     weights = torch.load("checkpoints/best.pt", map_location=device, weights_only=True)
     model.load_state_dict(weights)
-    print("模型加载成功，权重包含以下层:", list(weights.keys())[:5], "...")
+    print("Model loaded successfully, weights contain the following layers:", list(weights.keys())[:5], "...")
 except Exception as e:
-    print(f"模型加载失败: {e}")
+    print(f"Model loading failed: {e}")
 model.to(device)
 model.eval()
 
-# 3. 与训练一致的预处理
+# 3. Preprocessing consistent with training
 preprocess = transforms.Compose([
-    transforms.Resize((512, 512)),  # 确保与训练使用相同尺寸
+    transforms.Resize((512, 512)),  # Ensure the same size as used in training
     transforms.ToTensor(),
 ])
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
-    # 3.1 读取并转换为 RGB
+    # 3.1 Read and convert to RGB
     img_bytes = await file.read()
     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    print(f"接收到图像，大小: {img.size}")
+    print(f"Received image, size: {img.size}")
     
-    # 3.2 预处理 + 扩 batch 维度
+    # 3.2 Preprocess + add batch dimension
     x = preprocess(img).unsqueeze(0).to(device)    # [1,3,512,512]
-    print(f"输入张量形状: {x.shape}")
+    print(f"Input tensor shape: {x.shape}")
     
-    # 3.3 推理
+    # 3.3 Inference
     with torch.no_grad():
         logits = model(x)                          # [1,21,512,512]
-        print(f"输出 logits 形状: {logits.shape}")
-        print(f"类别分布: {torch.argmax(logits, dim=1).unique().tolist()}")
+        print(f"Output logits shape: {logits.shape}")
+        print(f"Class distribution: {torch.argmax(logits, dim=1).unique().tolist()}")
         mask = torch.argmax(logits, dim=1).squeeze(0)  # [512,512]
     
-    # 3.4 扁平化并返回
+    # 3.4 Flatten and return
     flat = mask.cpu().numpy().flatten().tolist()
-    print(f"返回掩码长度: {len(flat)}, 包含值范围: {min(flat)} - {max(flat)}")
+    print(f"Returned mask length: {len(flat)}, value range: {min(flat)} - {max(flat)}")
     return {"mask": flat}
 
-# 在 backend.py 中添加调试端点
+# Add debug endpoint to backend.py
 @app.get("/test_model")
 async def test_model():
-    # 创建测试图像 (一个纯色图像)
+    # Create test image (a solid color image)
     test_img = Image.new("RGB", (512, 512), color=(128, 128, 128))
     x = preprocess(test_img).unsqueeze(0).to(device)
     
@@ -136,7 +136,7 @@ async def test_model():
         logits = model(x)
         mask = torch.argmax(logits, dim=1).squeeze(0)
         
-    # 验证模型是否预测多个类别
+    # Validate if model predicts multiple classes
     unique_classes = mask.unique().tolist()
     
     return {
