@@ -452,22 +452,39 @@ def train(args):
             current_lr = scheduler.get_last_lr()[0]
             logger.info(f"Current learning rate: {current_lr:.6f}")
         
-        # Save epoch checkpoint
-        checkpoint_path = os.path.join(args.checkpoint_dir, f'epoch{epoch}.pt')
-        torch.save({
-            'epoch': epoch,
-            'model': model.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'scheduler': scheduler.state_dict() if scheduler else None,
-            'best_iou': best_iou,
-            'train_loss': train_loss,
-            'train_iou': train_iou,
-            'val_loss': val_loss,
-            'val_iou': val_iou
-        }, checkpoint_path)
-        logger.info(f"Saved epoch {epoch} checkpoint: {checkpoint_path}")
+        # 根据save-freq参数决定是否保存检查点
+        if epoch % args.save_freq == 0 or epoch == args.epochs:
+            # 保存epoch检查点
+            checkpoint_path = os.path.join(args.checkpoint_dir, f'epoch{epoch}.pt')
+            torch.save({
+                'epoch': epoch,
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict() if scheduler else None,
+                'best_iou': best_iou,
+                'train_loss': train_loss,
+                'train_iou': train_iou,
+                'val_loss': val_loss,
+                'val_iou': val_iou
+            }, checkpoint_path)
+            logger.info(f"Saved epoch {epoch} checkpoint: {checkpoint_path}")
+            
+            # 如果启用keep-last参数(>0)，则仅保留最近的N个检查点
+            if args.keep_last > 0:
+                checkpoints = [f for f in os.listdir(args.checkpoint_dir) 
+                              if f.startswith('epoch') and f.endswith('.pt') and f != 'best.pt']
+                # 按照epoch编号排序
+                checkpoints.sort(key=lambda x: int(x.replace('epoch', '').replace('.pt', '')), reverse=True)
+                # 仅保留最近的args.keep_last个检查点
+                for old_ckpt in checkpoints[args.keep_last:]:
+                    old_path = os.path.join(args.checkpoint_dir, old_ckpt)
+                    try:
+                        os.remove(old_path)
+                        logger.info(f"Removed old checkpoint: {old_path}")
+                    except Exception as e:
+                        logger.warning(f"Failed to remove old checkpoint {old_path}: {e}")
         
-        # Save best model
+        # 保存最佳模型
         current_iou = val_iou.cpu().item() if isinstance(val_iou, torch.Tensor) else val_iou
         if current_iou > best_iou:
             best_iou = current_iou
@@ -594,7 +611,7 @@ def parse_args():
     # Training parameters
     parser.add_argument('--batch-size', default=8, type=int, help='Training batch size')
     parser.add_argument('--epochs', default=200, type=int, help='Number of training epochs')
-    parser.add_argument('--lr', default=1e-1, type=float, help='Initial learning rate')
+    parser.add_argument('--lr', default=1e-2, type=float, help='Initial learning rate')
     parser.add_argument('--min-lr', default=1e-5, type=float, help='Minimum learning rate')
     parser.add_argument('--weight-decay', default=1e-4, type=float, help='Weight decay')
     parser.add_argument('--num-workers', default=6, type=int, help='Number of data loading workers')
@@ -608,8 +625,10 @@ def parse_args():
     
     # Training control parameters
     parser.add_argument('--resume', default='', type=str, help='Path to checkpoint to resume training')
-    parser.add_argument('--vis-freq', default=5, type=int, help='Visualization frequency (epoch)')
-    parser.add_argument('--vis-samples', default=3, type=int, help='Number of samples to visualize each time')
+    parser.add_argument('--save-freq', default=10, type=int, help='Checkpoint save frequency (epochs)')
+    parser.add_argument('--keep-last', default=10, type=int, help='Number of most recent checkpoints to keep (0 = keep all)')
+    parser.add_argument('--vis-freq', default=10, type=int, help='Visualization frequency (epoch)')
+    parser.add_argument('--vis-samples', default=5, type=int, help='Number of samples to visualize each time')
     
     # Output parameters
     parser.add_argument('--output-dir', default='output', type=str, help='Output directory')
@@ -618,7 +637,7 @@ def parse_args():
     parser.add_argument('--log-dir', default='logs', type=str, help='Log save directory')
     
     return parser.parse_args()
-
+    
 if __name__ == '__main__':
     args = parse_args()
     results = train(args)
