@@ -5,9 +5,9 @@ import uvicorn
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from fastapi import FastAPI, File, UploadFile, WebSocket
+from fastapi import FastAPI, File, UploadFile, WebSocket, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
-from PIL import Image
+from PIL import Image, ImageOps
 from torchvision import transforms
 import numpy as np
 import segmentation_models_pytorch as smp
@@ -28,6 +28,13 @@ def ensure_list(value):
         return value.tolist()
     return value
 
+# Function to fix image orientation based on EXIF data using PIL's built-in function
+def fix_orientation(image: Image.Image) -> Image.Image:
+    """
+    Fix the orientation of an image based on EXIF data using PIL's built-in function
+    """
+    return ImageOps.exif_transpose(image)
+
 # Store active WebSocket connections
 active_connections = {}
 
@@ -45,17 +52,30 @@ app.add_middleware(
 async def websocket_endpoint(websocket: WebSocket, client_id: str):
     await websocket.accept()
     active_connections[client_id] = websocket
+    print(f"WebSocket connected for client: {client_id}")
+    print(f"Active connections: {list(active_connections.keys())}")
+    
     try:
         while True:
-            # Keep connection open
+            # Keep connection open and listen for messages
             data = await websocket.receive_text()
+            
+            # 简化消息处理
+            try:
+                message = json.loads(data)
+                print(f"Received message from client {client_id}: {message}")
+            except json.JSONDecodeError:
+                print(f"Received invalid message from client: {data}")
+                
             if data == "close":
                 break
-    except:
-        pass
+    except Exception as e:
+        print(f"WebSocket error for client {client_id}: {e}")
     finally:
         if client_id in active_connections:
             del active_connections[client_id]
+            print(f"WebSocket connection closed for client: {client_id}")
+            print(f"Remaining active connections: {list(active_connections.keys())}")
             
 # 2. Load custom model weights
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -112,6 +132,9 @@ async def predict(file: UploadFile = File(...)):
     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     print(f"Received image, size: {img.size}")
     
+    # Fix image orientation based on EXIF data
+    img = fix_orientation(img)
+    
     # Store original image dimensions
     original_width, original_height = img.size
     
@@ -145,116 +168,146 @@ async def predict(file: UploadFile = File(...)):
     # 3.6 Generate overlay effect with updated transparency (0.6 for original image, 0.4 for mask)
     overlay = cv2.addWeighted(original_img, 0.6, color_mask_resized, 0.4, 0)
     
-    # 3.7 Convert images to base64 encoding
-    original_pil = Image.fromarray(original_img)
-    mask_pil = Image.fromarray(color_mask_resized)
-    overlay_pil = Image.fromarray(overlay)
+    # 重要修改：确保叠加图与原图保持一致方向，先转为PIL图像再进行方向处理
+    overlay_pil = Image.fromarray(overlay.astype('uint8'))
+    # 注意：对于直接从numpy生成的PIL图像，不存在EXIF数据，但为了代码一致性仍保留此调用
+    # 对于某些平台，此操作仍可能必要
+    overlay_pil = fix_orientation(overlay_pil)
+    overlay = np.array(overlay_pil)
     
-    # Create byte buffers for each image
-    original_buffer = io.BytesIO()
-    original_pil.save(original_buffer, format="PNG")
-    original_base64 = base64.b64encode(original_buffer.getvalue()).decode('utf-8')
-    
-    mask_buffer = io.BytesIO()
-    mask_pil.save(mask_buffer, format="PNG")
-    mask_base64 = base64.b64encode(mask_buffer.getvalue()).decode('utf-8')
-    
-    overlay_buffer = io.BytesIO()
-    overlay_pil.save(overlay_buffer, format="PNG")
-    overlay_base64 = base64.b64encode(overlay_buffer.getvalue()).decode('utf-8')
-    
-    # 3.8 Prepare class information and confidence scores
+    # 3.7 Collect results - detected classes with confidences
     detected_classes = []
+    for class_idx in np.unique(mask):
+        if class_idx > 0:  # Skip background class
+            confidence = float(probs[class_idx].max().cpu().numpy())
+            detected_classes.append({
+                "name": VOC_CLASSES[class_idx],
+                "confidence": confidence,
+                "color": ensure_list(VOC_COLORMAP[class_idx])
+            })
     
-    # Resize the prediction mask to original image size for calculating correct class stats
-    mask_resized = cv2.resize(mask, (original_width, original_height), interpolation=cv2.INTER_NEAREST)
+    # Sort by confidence 
+    detected_classes.sort(key=lambda x: x['confidence'], reverse=True)
     
-    for cls in np.unique(mask_resized):
-        if cls > 0:  # Ignore background class
-            cls_idx = int(cls)
-            
-            # We need to calculate confidence on the original prediction (before resize)
-            # Create a binary mask for this class
-            class_mask_512 = (mask == cls_idx)
-            
-            if np.any(class_mask_512):
-                # Calculate confidence from the probability tensor (still at 512x512)
-                class_confidence = float(probs[cls_idx][class_mask_512].mean().cpu())
-                
-                # Add class to results
-                detected_classes.append({
-                    "id": cls_idx,
-                    "name": VOC_CLASSES[cls_idx],
-                    "confidence": class_confidence,
-                    "color": VOC_COLORMAP[cls_idx]
-                })
+    # 3.8 Convert images to base64 strings
+    pil_img = img  # Already a PIL image
+    pil_mask = Image.fromarray(color_mask_resized.astype('uint8'))
+    pil_overlay = Image.fromarray(overlay.astype('uint8'))
     
-    print(f"Detected classes: {len(detected_classes)}")
+    img_byte_arr = io.BytesIO()
+    pil_img.save(img_byte_arr, format='PNG')
+    img_base64 = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
+    
+    mask_byte_arr = io.BytesIO()
+    pil_mask.save(mask_byte_arr, format='PNG')
+    mask_base64 = base64.b64encode(mask_byte_arr.getvalue()).decode('utf-8')
+    
+    overlay_byte_arr = io.BytesIO()
+    pil_overlay.save(overlay_byte_arr, format='PNG')
+    overlay_base64 = base64.b64encode(overlay_byte_arr.getvalue()).decode('utf-8')
     
     return {
-        "original_base64": f"data:image/png;base64,{original_base64}",
+        "original_base64": f"data:image/png;base64,{img_base64}",
         "mask_base64": f"data:image/png;base64,{mask_base64}",
         "overlay_base64": f"data:image/png;base64,{overlay_base64}",
-        "detected_classes": detected_classes,
-        "width": original_width,
-        "height": original_height
+        "detected_classes": detected_classes
     }
 
 # Video processing endpoint
 @app.post("/predict_video")
-async def predict_video(file: UploadFile = File(...)):
-    # Extract client ID (if present in request headers)
-    client_id = None
-    request_headers = getattr(file, "headers", {})
-    if "x-client-id" in request_headers:
-        client_id = request_headers["x-client-id"]
-        print(f"Received client ID: {client_id}")
+async def predict_video(
+    request: Request,
+    file: UploadFile = File(...),
+    x_client_id: str = Header(None)  # ← 使用 Header 参数接收 X-Client-ID
+):
+    # 1. Try to get client ID for WebSocket communication (from header or form data)
+    client_id = x_client_id
     
-    # Create temporary directory for video frames and results
+    # Extract client ID from form data as backup if header missing
+    form = await request.form()
+    form_client_id = form.get("client_id")
+    if not client_id and form_client_id:
+        client_id = form_client_id
+        
+    if client_id:
+        print(f"Received client ID from header: {client_id}")
+        
+    # Create temp directory for processing
     with tempfile.TemporaryDirectory() as temp_dir:
-        # Save uploaded video file
-        video_path = os.path.join(temp_dir, "input_video.mp4")
-        with open(video_path, "wb") as f:
-            f.write(await file.read())
+        # Save uploaded video to temp file
+        temp_video_path = os.path.join(temp_dir, file.filename)
+        with open(temp_video_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
         
-        # Use OpenCV to read the video
-        cap = cv2.VideoCapture(video_path)
+        # Open video file
+        cap = cv2.VideoCapture(temp_video_path)
         if not cap.isOpened():
-            return JSONResponse(status_code=400, content={"error": "Cannot open video file"})
+            return JSONResponse(status_code=500, content={"error": "Cannot open video file"})
         
-        # Get video information
-        fps = cap.get(cv2.CAP_PROP_FPS)
+        # Get video properties
         frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        print(f"Video: {frame_width}x{frame_height}, {fps} FPS, {total_frames} frames")
         
-        # Check and use FFmpeg for video transcoding (ensure browser compatibility)
+        # Prepare video writer - use the most compatible encoder
+        available_encoders = check_encoder_availability()
+        print(f"Available encoders: {available_encoders}")
+        
         output_path = os.path.join(temp_dir, "segmented_video_raw.mp4")
-        final_output_path = os.path.join(temp_dir, "segmented_video.mp4")
         
-        # Use appropriate encoder
-        encoders = check_encoder_availability()
-        if encoders.get("libx264", False):
-            fourcc = cv2.VideoWriter_fourcc(*'avc1')
-        elif encoders.get("mpeg4", False):
-            fourcc = cv2.VideoWriter_fourcc(*'XVID')
-        else:
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            
-        out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
-        if not out.isOpened():
-            # If VideoWriter creation fails, use MJPEG format (almost always available)
-            output_path = os.path.join(temp_dir, "segmented_video_raw.avi")
-            fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-            out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
-            if not out.isOpened():
-                return JSONResponse(status_code=500, content={"error": "Cannot create video writer"})
+        # Try different encoders in order of preference
+        encoder_success = False
+        
+        # 1. First try H.264 (most compatible)
+        if 'avc1' in available_encoders:
+            try:
+                fourcc = cv2.VideoWriter_fourcc(*'H264')
+                out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
+                if out.isOpened():
+                    encoder_success = True
+                    print("Using H264 encoder")
+            except Exception as e:
+                print(f"H264 encoder failed: {e}")
+        
+        # 2. Try MPEG-4 if H264 failed
+        if not encoder_success and 'mp4v' in available_encoders:
+            try:
+                output_path = os.path.join(temp_dir, "segmented_video_raw.mp4")
+                fourcc = cv2.VideoWriter_fourcc(*'MP4V')
+                out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
+                if out.isOpened():
+                    encoder_success = True
+                    print("Using MPEG-4 encoder")
+            except Exception as e:
+                print(f"MPEG-4 encoder failed: {e}")
+        
+        # 3. Try MJPEG as a reliable fallback
+        if not encoder_success:
+            try:
+                output_path = os.path.join(temp_dir, "segmented_video_raw.avi")
+                fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+                out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
+                if out.isOpened():
+                    encoder_success = True
+                    print("Using MJPEG encoder")
+                else:
+                    print("MJPEG encoder failed to open")
+            except Exception as e:
+                print(f"MJPEG encoder failed: {e}")
+        
+        if not encoder_success:
+            return JSONResponse(status_code=500, content={"error": "Failed to initialize any video encoder"})
         
         # Process each frame
         frames_processed = 0
         class_stats = {}
+        processing_aborted = False
         
         while cap.isOpened():
+            # Check for abort request
             ret, frame = cap.read()
             if not ret:
                 break
@@ -262,6 +315,13 @@ async def predict_video(file: UploadFile = File(...)):
             # Convert to PIL image for processing
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             pil_img = Image.fromarray(frame_rgb)
+            
+            # Fix any orientation issues
+            # Note: Video frames usually don't have EXIF data, but we include this for completeness
+            pil_img = fix_orientation(pil_img)
+            
+            # Update frame_rgb in case the orientation was fixed
+            frame_rgb = np.array(pil_img)
             
             # Preprocess
             x = preprocess(pil_img).unsqueeze(0).to(device)
@@ -277,133 +337,178 @@ async def predict_video(file: UploadFile = File(...)):
             
             # Resize back to original dimensions
             color_mask_resized = cv2.resize(color_mask, (frame_width, frame_height), 
-                                           interpolation=cv2.INTER_NEAREST)
+                                         interpolation=cv2.INTER_NEAREST)
             
-            # Create overlay effect with updated transparency (0.6 for original image, 0.4 for mask)
+            # Create overlay
             overlay = cv2.addWeighted(frame_rgb, 0.6, color_mask_resized, 0.4, 0)
             
-            # Write to output video (convert back to BGR format)
-            overlay_bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
-            out.write(overlay_bgr)
+            # 重要修改：确保视频中的叠加图与原图保持一致方向
+            overlay_pil = Image.fromarray(overlay.astype('uint8'))
+            overlay_pil = fix_orientation(overlay_pil)
+            overlay = np.array(overlay_pil)
             
-            # Accumulate class statistics
-            mask_resized = cv2.resize(mask, (frame_width, frame_height), interpolation=cv2.INTER_NEAREST)
-            for cls in np.unique(mask_resized):
-                if cls > 0:  # Ignore background class
-                    cls_idx = int(cls)
-                    class_mask = (mask == cls_idx)
+            # Convert RGB back to BGR for OpenCV
+            output_frame = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
+            
+            # Write frame
+            out.write(output_frame)
+            
+            # Track classes detected in this frame
+            for class_idx in np.unique(mask):
+                if class_idx > 0:  # Skip background
+                    confidence = float(probs[class_idx].max().cpu().numpy())
+                    class_name = VOC_CLASSES[class_idx]
+                    class_color = VOC_COLORMAP[class_idx]
                     
-                    if np.any(class_mask):
-                        # Calculate confidence for this class
-                        class_confidence = float(probs[cls_idx][class_mask].mean().cpu())
-                        
-                        # Update class statistics
-                        if cls_idx not in class_stats:
-                            class_stats[cls_idx] = {
-                                "id": cls_idx,
-                                "name": VOC_CLASSES[cls_idx],
-                                "color": ensure_list(VOC_COLORMAP[cls_idx]),
-                                "frames": 0,
-                                "avg_confidence": 0
-                            }
-                        
-                        # Update frame count and average confidence
-                        current = class_stats[cls_idx]
-                        current["frames"] += 1
-                        current["avg_confidence"] = (current["avg_confidence"] * (current["frames"] - 1) + 
-                                                     class_confidence) / current["frames"]
+                    if class_name not in class_stats:
+                        class_stats[class_name] = {
+                            "frames": 1,
+                            "total_confidence": confidence,
+                            "color": class_color
+                        }
+                    else:
+                        class_stats[class_name]["frames"] += 1
+                        class_stats[class_name]["total_confidence"] += confidence
             
+            # Update progress
             frames_processed += 1
+            progress = frames_processed / total_frames
             
-            # Update progress every 5 frames
-            if frames_processed % 5 == 0 or frames_processed == total_frames:
-                progress = (frames_processed / total_frames) * 100
-                print(f"Processed {frames_processed}/{total_frames} frames ({progress:.1f}%)")
-                
-                # Send progress updates via WebSocket
-                if client_id and client_id in active_connections:
-                    try:
-                        await active_connections[client_id].send_json({
-                            "type": "progress",
-                            "frames_processed": frames_processed,
-                            "total_frames": total_frames,
-                            "progress": progress
-                        })
-                    except Exception as e:
-                        print(f"WebSocket send failed: {e}")
-        
+            # Send progress update via WebSocket
+            if client_id in active_connections:
+                try:
+                    await active_connections[client_id].send_text(json.dumps({
+                        "progress": progress,
+                        "frames_processed": frames_processed,
+                        "total_frames": total_frames
+                    }))
+                except Exception as e:
+                    print(f"Error sending WebSocket update: {e}")
+            
+        # Close video resources
         cap.release()
         out.release()
         
-        # Use FFmpeg to re-encode video for browser compatibility
-        try:
-            if os.path.exists(output_path):
-                # Use FFmpeg to optimize video for browser playback
-                ffmpeg_cmd = [
-                    "ffmpeg", "-y", "-i", output_path, 
-                    "-c:v", "libx264", "-preset", "fast", 
-                    "-profile:v", "baseline", "-level", "3.0",
-                    "-pix_fmt", "yuv420p", final_output_path
-                ]
-                
-                subprocess.run(ffmpeg_cmd, check=True)
-                print("FFmpeg successfully transcoded video!")
-                
-                # If FFmpeg succeeded, use the transcoded video
-                if os.path.exists(final_output_path) and os.path.getsize(final_output_path) > 0:
-                    output_path = final_output_path
-        except Exception as e:
-            print(f"FFmpeg transcoding failed: {e}")
-            # If FFmpeg fails, continue with original video
-            final_output_path = output_path
+        if frames_processed < 3:  # Sanity check - at least 3 frames should be processed
+            return JSONResponse(status_code=500, content={"error": "Video processing failed - too few frames processed"})
         
-        # Read result video and convert to base64
+        # Optimize output video for web viewing
+        web_output_path = os.path.join(temp_dir, "segmented_video_web.mp4")
+        
         try:
-            with open(output_path, "rb") as video_file:
-                video_bytes = video_file.read()
-                video_base64 = base64.b64encode(video_bytes).decode('utf-8')
-                
-            # Sort class statistics (by frame count in descending order)
-            classes_list = list(class_stats.values())
-            classes_list.sort(key=lambda x: x["frames"], reverse=True)
+            # Use ffmpeg for web-optimized output if available
+            optimize_cmd = [
+                'ffmpeg', '-i', output_path,
+                '-vcodec', 'libx264', 
+                '-crf', '23',  # Lower CRF = better quality (18-28 is a good range)
+                '-preset', 'medium',  # faster = quicker encoding, slower = better compression
+                '-movflags', 'faststart',  # Move MOOV atom to the beginning for fast start
+                '-pix_fmt', 'yuv420p',  # Standard pixel format for web
+                web_output_path
+            ]
             
-            # Return video and analysis results
-            return {
-                "video_base64": f"data:video/mp4;base64,{video_base64}",
-                "detected_classes": classes_list,
-                "total_frames": total_frames,
-                "fps": fps,
-                "width": frame_width,
-                "height": frame_height
-            }
+            process = subprocess.run(
+                optimize_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            
+            if process.returncode != 0:
+                print(f"FFmpeg error: {process.stderr.decode()}")
+                # Use original output if optimization fails
+                web_output_path = output_path
         except Exception as e:
-            print(f"Video processing final stage failed: {e}")
-            return JSONResponse(status_code=500, content={"error": f"Video processing failed: {str(e)}"})
+            print(f"Failed to optimize video: {e}")
+            web_output_path = output_path
+        
+        # Convert to base64 for web embedding
+        with open(web_output_path, "rb") as f:
+            video_bytes = f.read()
+            video_base64 = base64.b64encode(video_bytes).decode('utf-8')
+        
+        # Format class stats
+        detected_classes = []
+        for class_name, stats in class_stats.items():
+            avg_confidence = stats["total_confidence"] / stats["frames"]
+            detected_classes.append({
+                "name": class_name,
+                "frames": stats["frames"],
+                "avg_confidence": avg_confidence,
+                "color": ensure_list(stats["color"])
+            })
+        
+        # Sort by frequency
+        detected_classes.sort(key=lambda x: x['frames'], reverse=True)
+        
+        return {
+            "video_base64": f"data:video/mp4;base64,{video_base64}",
+            "detected_classes": detected_classes,
+            "total_frames": total_frames,
+            "processed_frames": frames_processed
+        }
 
 # Check video encoder availability
 def check_encoder_availability():
     try:
-        result = subprocess.run(['ffmpeg', '-encoders'], capture_output=True, text=True)
-        output = result.stdout
-        encoders = {
-            "libx264": "libx264" in output,
-            "h264": "h264" in output,
-            "mpeg4": "mpeg4" in output,
-            "libvpx": "libvpx" in output,
-            "libvpx-vp9": "libvpx-vp9" in output,
-            "libtheora": "libtheora" in output,
-            "mjpeg": "mjpeg" in output
-        }
-        print(f"Available encoders: {[k for k, v in encoders.items() if v]}")
-        return encoders
-    except:
-        print("Unable to check encoder availability")
-        return {
-            "libx264": False,
-            "h264": False,
-            "mpeg4": True,  # Assume MPEG4 is at least available
-            "libvpx": False,
-            "libvpx-vp9": False,
-            "libtheora": False,
-            "mjpeg": True  # MJPEG is usually available
-        }
+        available_encoders = []
+        
+        # Check common encoders with their fourcc codes
+        codecs_to_check = [
+            ('mjpeg', 'MJPG'),  # Motion JPEG - widely supported
+            ('avc1', 'H264'),    # H.264
+            ('mp4v', 'MP4V'),    # MPEG-4
+            ('divx', 'DIVX'),    # DivX
+            ('xvid', 'XVID'),    # Xvid
+        ]
+        
+        for name, code in codecs_to_check:
+            try:
+                # Create a temporary file
+                with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as temp_file:
+                    temp_path = temp_file.name
+                
+                # Test writing a small sample
+                fourcc = cv2.VideoWriter_fourcc(*code)
+                test = cv2.VideoWriter(
+                    temp_path, 
+                    fourcc,
+                    30,  # fps
+                    (320, 240),  # small resolution
+                    True  # isColor
+                )
+                
+                if test.isOpened():
+                    # Create a small test frame
+                    test_frame = np.zeros((240, 320, 3), dtype=np.uint8)
+                    test.write(test_frame)
+                    test.release()
+                    
+                    # Verify file was created and has content
+                    if os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
+                        available_encoders.append(name)
+                        print(f"Encoder {name} ({code}) is available and working")
+                else:
+                    print(f"Encoder {name} ({code}) failed to open")
+                    
+                # Clean up
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                    
+            except Exception as e:
+                print(f"Error testing encoder {name}: {e}")
+                continue
+        
+        # Always ensure at least MJPEG is available as fallback
+        if not available_encoders:
+            print("No working encoders detected, defaulting to MJPEG")
+            available_encoders = ['mjpeg']
+            
+        return available_encoders
+    except Exception as e:
+        print(f"Error checking encoder availability: {e}")
+        return ['mjpeg']  # Fallback to MJPEG in case of errors
+
+# 启动 web 服务器
+if __name__ == "__main__":
+    print("Starting the web server...")
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")

@@ -146,23 +146,11 @@
       color: #666;
       font-size: 0.9em;
     }
-    .progress-container {
-      width: 100%;
-      height: 20px;
-      background-color: #f0f0f0;
-      border-radius: 5px;
-      margin: 15px 0;
-      overflow: hidden;
-      display: none;
-    }
-    .progress-bar {
-      height: 100%;
-      background-color: #4CAF50;
+    .processing-text {
       text-align: center;
-      line-height: 20px;
-      color: white;
-      transition: width 0.3s ease;
-      width: 0;
+      color: #666;
+      margin-bottom: 10px;
+      font-size: 14px;
     }
   </style>
 </head>
@@ -179,11 +167,8 @@
     <input type="file" id="fileInput" accept="image/*" style="display:none">
   </div>
 
-  <div class="progress-container" id="progressContainer">
-    <div class="progress-bar" id="progressBar">0%</div>
-  </div>
-
   <div id="spinner" class="spinner"></div>
+  <div id="processingText" class="processing-text"></div>
 
   <div id="resultContainer" class="result-container">
     <div class="result-item">
@@ -225,62 +210,159 @@
     const legend = document.getElementById('legend');
     const legendItems = document.getElementById('legendItems');
     const spinner = document.getElementById('spinner');
-    const progressContainer = document.getElementById('progressContainer');
-    const progressBar = document.getElementById('progressBar');
+    const processingText = document.getElementById('processingText');
     
     let currentMode = 'image'; // Default is image mode
     let ws = null; // WebSocket connection
     let clientId = 'client_' + Date.now(); // Generate unique client ID
+    let wsConnected = false; // Flag to indicate if WebSocket is connected
+    
+    // Function to wait for WebSocket connection
+    async function waitForWebSocket() {
+      console.log('Waiting for WebSocket connection...');
+      // Return directly if already connected
+      if (wsConnected && ws && ws.readyState === WebSocket.OPEN) {
+        console.log('WebSocket already connected');
+        return true;
+      }
+      
+      // Try to reconnect if not connected
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        connectWebSocket();
+        
+        // Wait for connection establishment, maximum 5 seconds
+        const maxWaitTime = 5000; // 5 seconds
+        const startTime = Date.now();
+        
+        while (!wsConnected && (Date.now() - startTime) < maxWaitTime) {
+          await new Promise(r => setTimeout(r, 100));
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            console.log('WebSocket connected successfully');
+            return true;
+          }
+        }
+        
+        if (!wsConnected) {
+          console.error('WebSocket connection timed out');
+          return false;
+        }
+      }
+      
+      return wsConnected;
+    }
     
     // WebSocket connection function
     function connectWebSocket() {
       if (ws) {
-        // If connection exists, close it first
-        ws.close();
+        try {
+          // Close existing connection first
+          ws.close();
+          wsConnected = false;
+        } catch (e) {
+          console.error('Error closing existing WebSocket:', e);
+        }
       }
       
-      // Create new connection
-      ws = new WebSocket(`ws://127.0.0.1:8000/ws/${clientId}`);
-      
-      ws.onopen = function() {
-        console.log('WebSocket connection established');
-      };
-      
-      ws.onmessage = function(event) {
-        try {
-          const data = JSON.parse(event.data);
-          if (data.type === 'progress') {
-            // Update progress bar based on frame processing
-            const progress = data.progress;
-            progressBar.style.width = progress + '%';
-            progressBar.textContent = `Processed ${data.frames_processed}/${data.total_frames} frames (${Math.round(progress)}%)`;
-            
-            // Make sure the progress container is visible
-            progressContainer.style.display = 'block';
+      try {
+        // Create new connection
+        ws = new WebSocket(`ws://127.0.0.1:8000/ws/${clientId}`);
+        
+        ws.onopen = function() {
+          console.log('WebSocket connection established');
+          wsConnected = true; // Mark connection as established
+          
+          // Show temporary notification that connection is established
+          const connectionStatus = document.createElement('div');
+          connectionStatus.style.position = 'fixed';
+          connectionStatus.style.top = '10px';
+          connectionStatus.style.right = '10px';
+          connectionStatus.style.padding = '5px 10px';
+          connectionStatus.style.background = 'rgba(0, 128, 0, 0.7)';
+          connectionStatus.style.color = 'white';
+          connectionStatus.style.borderRadius = '3px';
+          connectionStatus.textContent = 'Server connection established';
+          document.body.appendChild(connectionStatus);
+          
+          // Remove notification after 3 seconds
+          setTimeout(() => {
+            document.body.removeChild(connectionStatus);
+          }, 3000);
+        };
+        
+        ws.onmessage = function(event) {
+          // Only log messages without updating progress bar
+          try {
+            console.log('Received WebSocket message:', event.data);
+            // Don't process progress updates, only maintain the connection itself
+          } catch (e) {
+            console.error('WebSocket message parsing error:', e);
           }
-        } catch (e) {
-          console.error('WebSocket message parsing error:', e);
-        }
-      };
-      
-      ws.onclose = function() {
-        console.log('WebSocket connection closed');
-        // Could add reconnection logic here, but keeping it simple
-      };
-      
-      ws.onerror = function(error) {
-        console.error('WebSocket error:', error);
-      };
+        };
+        
+        ws.onclose = function(event) {
+          console.log('WebSocket connection closed:', event.code, event.reason);
+          wsConnected = false; // Mark connection as closed
+          
+          // Try to reconnect when connection is lost
+          setTimeout(function() {
+            connectWebSocket();
+          }, 2000);
+        };
+        
+        ws.onerror = function(error) {
+          console.error('WebSocket error:', error);
+          wsConnected = false; // Mark connection as error
+          
+          // Show error notification
+          const errorStatus = document.createElement('div');
+          errorStatus.style.position = 'fixed';
+          errorStatus.style.top = '10px';
+          errorStatus.style.right = '10px';
+          errorStatus.style.padding = '5px 10px';
+          errorStatus.style.background = 'rgba(255, 0, 0, 0.7)';
+          errorStatus.style.color = 'white';
+          errorStatus.style.borderRadius = '3px';
+          errorStatus.textContent = 'Server connection failed, attempting to reconnect';
+          document.body.appendChild(errorStatus);
+          
+          // Remove notification after 3 seconds
+          setTimeout(() => {
+            if (document.body.contains(errorStatus)) {
+              document.body.removeChild(errorStatus);
+            }
+          }, 3000);
+        };
+      } catch (e) {
+        console.error('Error establishing WebSocket connection:', e);
+        wsConnected = false;
+        
+        // Try to reconnect later if connection fails
+        setTimeout(function() {
+          connectWebSocket();
+        }, 3000);
+      }
     }
     
-    // Connect WebSocket on page load
-    window.addEventListener('load', connectWebSocket);
+    // Connect WebSocket when page loads
+    window.addEventListener('load', function() {
+      console.log('Page loaded, connecting WebSocket...');
+      connectWebSocket();
+    });
     
     // Tab switching events
-    imageTab.addEventListener('click', () => switchMode('image'));
-    videoTab.addEventListener('click', () => switchMode('video'));
-
+    imageTab.addEventListener('click', function() { 
+      console.log('Image tab clicked');
+      switchMode('image');
+    });
+    
+    videoTab.addEventListener('click', function() {
+      console.log('Video tab clicked'); 
+      switchMode('video');
+    });
+    
     function switchMode(mode) {
+      if (currentMode === mode) return;
+      
       currentMode = mode;
       
       if (mode === 'image') {
@@ -300,25 +382,46 @@
       videoContainer.style.display = 'none';
       legend.style.display = 'none';
       spinner.style.display = 'none';
-      progressContainer.style.display = 'none';
+      processingText.style.display = 'none';
     }
     
     // Bind upload events
-    uploadBox.addEventListener('click', () => fileInput.click());
-    uploadBox.addEventListener('dragover', e => {
+    uploadBox.addEventListener('click', function() {
+      console.log('Upload box clicked');
+      fileInput.click();
+    });
+    
+    uploadBox.addEventListener('dragover', function(e) {
       e.preventDefault();
+      e.stopPropagation();
       uploadBox.classList.add('hover');
     });
-    uploadBox.addEventListener('dragleave', () => uploadBox.classList.remove('hover'));
-    uploadBox.addEventListener('drop', e => {
+    
+    uploadBox.addEventListener('dragleave', function(e) {
       e.preventDefault();
+      e.stopPropagation();
       uploadBox.classList.remove('hover');
-      handleFile(e.dataTransfer.files[0]);
     });
-    fileInput.addEventListener('change', () => handleFile(fileInput.files[0]));
+    
+    uploadBox.addEventListener('drop', function(e) {
+      console.log('File dropped');
+      e.preventDefault();
+      e.stopPropagation();
+      uploadBox.classList.remove('hover');
+      if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+        handleFile(e.dataTransfer.files[0]);
+      }
+    });
+    
+    fileInput.addEventListener('change', function(e) {
+      console.log('File selected via input');
+      if (this.files && this.files.length > 0) {
+        handleFile(this.files[0]);
+      }
+    });
 
     // Handle uploaded file
-    function handleFile(file) {
+    async function handleFile(file) {
       if (!file) return;
       
       if (currentMode === 'image') {
@@ -332,16 +435,26 @@
         
         // Show loading animation
         spinner.style.display = 'block';
+        processingText.textContent = 'Processing image...';
+        processingText.style.display = 'block';
         resultContainer.style.display = 'none';
         videoContainer.style.display = 'none';
         legend.style.display = 'none';
       } else {
         // Video processing mode
+        // Ensure WebSocket is ready before processing video
+        const wsReady = await waitForWebSocket();
+        if (!wsReady) {
+          alert('Server connection unavailable, please try again later');
+          return;
+        }
+        
         sendVideoToBackend(file);
         
-        // Show loading progress bar
-        progressContainer.style.display = 'block';
+        // Show loading animation only
         spinner.style.display = 'block';
+        processingText.textContent = 'Processing video, please wait...';
+        processingText.style.display = 'block';
         resultContainer.style.display = 'none';
         videoContainer.style.display = 'none';
         legend.style.display = 'none';
@@ -370,6 +483,7 @@
         console.error('Prediction failed:', err);
         alert('Model inference failed. Please check if backend service is running.');
         spinner.style.display = 'none';
+        processingText.style.display = 'none';
       });
     }
     
@@ -379,60 +493,61 @@
       if (file.size > 100 * 1024 * 1024) { // 100MB
         alert('Video file is too large. Please upload a video smaller than 100MB.');
         spinner.style.display = 'none';
-        progressContainer.style.display = 'none';
+        processingText.style.display = 'none';
         return;
       }
       
       const form = new FormData();
       form.append('file', file);
+      // Use form field to pass client ID, avoiding potential header issues
+      form.append('client_id', clientId);
       
-      // Create custom request with client ID
+      // Create custom request object
       const xhr = new XMLHttpRequest();
       xhr.open('POST', 'http://127.0.0.1:8000/predict_video', true);
-      xhr.setRequestHeader('X-Client-ID', clientId);  // Add client ID to headers
+      // Pass clientId through both header and form field to increase success rate
+      xhr.setRequestHeader('X-Client-ID', clientId);  
       
       // Upload progress monitoring
       xhr.upload.onprogress = function(e) {
         if (e.lengthComputable) {
           const percentComplete = (e.loaded / e.total) * 100;
-          progressBar.style.width = percentComplete + '%';
-          progressBar.textContent = `Uploading: ${Math.round(percentComplete)}%`;
+          processingText.textContent = `Uploading: ${Math.round(percentComplete)}%`;
         }
       };
       
       // When upload completes
       xhr.upload.onload = function() {
-        progressBar.style.width = '0%'; // Reset progress bar for processing phase
-        progressBar.textContent = 'Waiting for processing to start...';
-        // Progress will be updated via WebSocket
+        processingText.textContent = 'Processing video, please wait patiently...';
       };
       
-      // Request completion handler
+      // Request completion handling
       xhr.onload = function() {
         if (xhr.status === 200) {
           try {
             const data = JSON.parse(xhr.responseText);
+            // Normal processing complete, display results
             displayVideoResults(data);
           } catch (e) {
             console.error('Error parsing response data:', e);
             alert('Error processing video. Could not parse results.');
             spinner.style.display = 'none';
-            progressContainer.style.display = 'none';
+            processingText.style.display = 'none';
           }
         } else {
           console.error('Video processing failed:', xhr.statusText);
           alert(`Video processing failed (${xhr.status}). Please check backend service.`);
           spinner.style.display = 'none';
-          progressContainer.style.display = 'none';
+          processingText.style.display = 'none';
         }
       };
       
-      // Request error handler
+      // Request error handling
       xhr.onerror = function() {
         console.error('Request error');
         alert('Request error. Cannot connect to backend service.');
         spinner.style.display = 'none';
-        progressContainer.style.display = 'none';
+        processingText.style.display = 'none';
       };
       
       // Send request
@@ -443,6 +558,7 @@
     function displayImageResults(data) {
       // Hide loading animation
       spinner.style.display = 'none';
+      processingText.style.display = 'none';
       
       // Show results container
       resultContainer.style.display = 'flex';
@@ -459,9 +575,9 @@
     
     // Display video processing results
     function displayVideoResults(data) {
-      // Hide loading animation and progress bar
+      // Hide loading animation
       spinner.style.display = 'none';
-      progressContainer.style.display = 'none';
+      processingText.style.display = 'none';
       
       // Show video results
       resultContainer.style.display = 'none';

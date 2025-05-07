@@ -101,7 +101,7 @@ class VOC2012Dataset(Dataset):
             # 同步应用于图像和掩码的空间变换
             self.spatial_transforms = transforms.Compose([
                 transforms.RandomHorizontalFlip(p=0.5),
-                transforms.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1), 
+                transforms.RandomAffine(degrees=180, translate=(0.1, 0.1), scale=(0.9, 1.1), 
                                        interpolation=Image.NEAREST),
                 transforms.Resize((self.img_size, self.img_size), interpolation=Image.NEAREST)
             ])
