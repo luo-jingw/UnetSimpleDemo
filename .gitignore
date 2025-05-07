@@ -1,7 +1,5 @@
-*
-!.gitignore
-! ./DatasetVoc2012.py
-! ./unet_train.py
-! ./backend.py
-! ./demo.html
-! ./requirements.txt
+voc_data/
+checkpoints/
+*.pyc
+__pycache__/
+*.pkl
