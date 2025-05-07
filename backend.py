@@ -13,7 +13,7 @@ import numpy as np
 import segmentation_models_pytorch as smp
 import cv2
 
-# 从DatasetVoc2012导入颜色映射
+# Import color mapping from DatasetVoc2012
 from DatasetVoc2012 import VOC_COLORMAP, VOC_CLASSES
 
 # 1. Create FastAPI application and enable CORS
@@ -27,10 +27,10 @@ app.add_middleware(
 
 # 2. Load custom model weights
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# 使用与训练时相同的模型结构
+# Use the same model structure as during training
 model = smp.Unet(
     encoder_name='resnet34',
-    encoder_weights=None,  # 不需要预训练权重，因为我们会加载训练好的权重
+    encoder_weights=None,  # We don't need pretrained weights as we'll load our trained weights
     in_channels=3,
     classes=21
 )
@@ -43,26 +43,26 @@ except Exception as e:
 model.to(device)
 model.eval()
 
-# 3. 使用与训练时相同的预处理
+# 3. Preprocessing consistent with training
 preprocess = transforms.Compose([
-    transforms.Resize((512, 512)),  # 确保与训练时相同的尺寸
+    transforms.Resize((512, 512)),  # Same size as used during training
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # 添加归一化
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # Add normalization
 ])
 
 def decode_segmap(mask):
     """
-    将分割掩码转换为RGB彩色图像
+    Convert segmentation mask to RGB color image
     mask: [H, W] tensor with class indices 0-20
     returns: [H, W, 3] numpy array, RGB color image
     """
     if isinstance(mask, torch.Tensor):
         mask = mask.numpy()
     
-    # 将掩码转换为整数类型，确保没有中间值
+    # Convert mask to integer type, ensure no intermediate values
     mask = mask.astype(np.int32)
     
-    # 剪裁确保掩码值在有效范围内 (0-20)
+    # Clip to ensure mask values are in valid range (0-20)
     mask = np.clip(mask, 0, 20)
     
     h, w = mask.shape
@@ -83,9 +83,8 @@ async def predict(file: UploadFile = File(...)):
     # Store original image dimensions
     original_width, original_height = img.size
     
-    # 保存原始图像以便后续合并
-    original_img_resized = img.resize((512, 512))
-    original_img_np = np.array(original_img_resized)
+    # Save original image for later merging
+    original_img = np.array(img)
     
     # 3.2 Preprocess + add batch dimension
     x = preprocess(img).unsqueeze(0).to(device)    # [1,3,512,512]
@@ -96,43 +95,61 @@ async def predict(file: UploadFile = File(...)):
         output = model(x)                          # [1,21,512,512]
         print(f"Output shape: {output.shape}")
         
-        # 直接使用argmax获取预测的类别索引
+        # Get predicted classes using argmax
         mask = torch.argmax(output, dim=1).squeeze(0).cpu().numpy()  # [512,512]
         
-        # 获取每个类别的置信度
+        # Get class confidence scores
         probs = F.softmax(output, dim=1).squeeze(0)  # [21,512,512]
         
         print(f"Class distribution: {np.unique(mask).tolist()}")
     
-    # 3.4 生成彩色掩码
-    color_mask = decode_segmap(mask)
+    # 3.4 Generate color mask
+    color_mask = decode_segmap(mask)  # [512,512,3]
     
-    # 3.5 生成叠加效果（合并）
-    overlay = cv2.addWeighted(original_img_np, 0.7, color_mask, 0.3, 0)
+    # 3.5 Resize mask back to original image size
+    color_mask_resized = cv2.resize(color_mask, (original_width, original_height), 
+                                   interpolation=cv2.INTER_NEAREST)
     
-    # 3.6 将图像转换为base64编码
-    mask_img = Image.fromarray(color_mask)
-    overlay_img = Image.fromarray(overlay)
+    # 3.6 Generate overlay effect
+    overlay = cv2.addWeighted(original_img, 0.7, color_mask_resized, 0.3, 0)
+    
+    # 3.7 Convert images to base64 encoding
+    original_pil = Image.fromarray(original_img)
+    mask_pil = Image.fromarray(color_mask_resized)
+    overlay_pil = Image.fromarray(overlay)
+    
+    # Create byte buffers for each image
+    original_buffer = io.BytesIO()
+    original_pil.save(original_buffer, format="PNG")
+    original_base64 = base64.b64encode(original_buffer.getvalue()).decode('utf-8')
     
     mask_buffer = io.BytesIO()
-    mask_img.save(mask_buffer, format="PNG")
+    mask_pil.save(mask_buffer, format="PNG")
     mask_base64 = base64.b64encode(mask_buffer.getvalue()).decode('utf-8')
     
     overlay_buffer = io.BytesIO()
-    overlay_img.save(overlay_buffer, format="PNG")
+    overlay_pil.save(overlay_buffer, format="PNG")
     overlay_base64 = base64.b64encode(overlay_buffer.getvalue()).decode('utf-8')
     
-    # 3.7 准备返回的类别信息和置信度
-    class_confidences = {}
+    # 3.8 Prepare class information and confidence scores
     detected_classes = []
     
-    for cls in np.unique(mask):
-        if cls > 0:  # 忽略背景类
+    # Resize the prediction mask to original image size for calculating correct class stats
+    mask_resized = cv2.resize(mask, (original_width, original_height), interpolation=cv2.INTER_NEAREST)
+    
+    for cls in np.unique(mask_resized):
+        if cls > 0:  # Ignore background class
             cls_idx = int(cls)
-            class_mask = (mask == cls_idx)
-            if np.any(class_mask):
-                class_confidence = float(probs[cls_idx][class_mask].mean().cpu())
-                class_confidences[cls_idx] = class_confidence
+            
+            # We need to calculate confidence on the original prediction (before resize)
+            # Create a binary mask for this class
+            class_mask_512 = (mask == cls_idx)
+            
+            if np.any(class_mask_512):
+                # Calculate confidence from the probability tensor (still at 512x512)
+                class_confidence = float(probs[cls_idx][class_mask_512].mean().cpu())
+                
+                # Add class to results
                 detected_classes.append({
                     "id": cls_idx,
                     "name": VOC_CLASSES[cls_idx],
@@ -143,6 +160,7 @@ async def predict(file: UploadFile = File(...)):
     print(f"Detected classes: {len(detected_classes)}")
     
     return {
+        "original_base64": f"data:image/png;base64,{original_base64}",
         "mask_base64": f"data:image/png;base64,{mask_base64}",
         "overlay_base64": f"data:image/png;base64,{overlay_base64}",
         "detected_classes": detected_classes,
