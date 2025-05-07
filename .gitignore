@@ -1,9 +1,7 @@
 *
 !.gitignore
-! ./test.py
-! ./train.py
-! ./Dataset.py
-! ./UnetppModel.py
+! ./DatasetVoc2012.py
+! ./Unet_train.py
 ! ./backend.py
 ! ./demo.html
 ! ./requirements.txt

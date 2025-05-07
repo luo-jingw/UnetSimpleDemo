@@ -10,71 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 from torchvision import transforms
 import numpy as np
-
-# Define model structure to ensure compatibility when loading weights
-class ConvBlock(nn.Module):
-    def __init__(self, in_ch, out_ch):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=1),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True)
-        )
-    
-    def forward(self, x):
-        return self.conv(x)
-
-class UNetPlusPlus(nn.Module):
-    def __init__(self, in_channels=3, num_classes=21):
-        super().__init__()
-        
-        # Encoder
-        self.enc1 = ConvBlock(in_channels, 64)
-        self.enc2 = ConvBlock(64, 128)
-        self.enc3 = ConvBlock(128, 256)
-        self.enc4 = ConvBlock(256, 512)
-        
-        # Pooling layer
-        self.pool = nn.MaxPool2d(2)
-        
-        # Nested skip connections
-        self.conv0_1 = ConvBlock(64 + 128, 64)
-        self.conv1_1 = ConvBlock(128 + 256, 128)
-        self.conv2_1 = ConvBlock(256 + 512, 256)
-        
-        self.conv0_2 = ConvBlock(64 + 64 + 128, 64)
-        self.conv1_2 = ConvBlock(128 + 128 + 256, 128)
-        
-        self.conv0_3 = ConvBlock(64 + 64 + 64 + 128, 64)
-        
-        # Upsampling
-        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        
-        # Final output
-        self.final = nn.Conv2d(64, num_classes, 1)
-    
-    def forward(self, x):
-        # Encoder
-        x0_0 = self.enc1(x)
-        x1_0 = self.enc2(self.pool(x0_0))
-        x2_0 = self.enc3(self.pool(x1_0))
-        x3_0 = self.enc4(self.pool(x2_0))
-        
-        # Decoder
-        x0_1 = self.conv0_1(torch.cat([x0_0, self.up(x1_0)], 1))
-        x1_1 = self.conv1_1(torch.cat([x1_0, self.up(x2_0)], 1))
-        x2_1 = self.conv2_1(torch.cat([x2_0, self.up(x3_0)], 1))
-        
-        x0_2 = self.conv0_2(torch.cat([x0_0, x0_1, self.up(x1_1)], 1))
-        x1_2 = self.conv1_2(torch.cat([x1_0, x1_1, self.up(x2_1)], 1))
-        
-        x0_3 = self.conv0_3(torch.cat([x0_0, x0_1, x0_2, self.up(x1_2)], 1))
-        
-        # Output
-        return self.final(x0_3)
+import segmentation_models_pytorch as smp
 
 # 1. Create FastAPI application and enable CORS
 app = FastAPI()
@@ -87,10 +23,15 @@ app.add_middleware(
 
 # 2. Load custom model weights
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = UNetPlusPlus(in_channels=3, num_classes=21)
+# 使用与训练时相同的模型结构
+model = smp.Unet(
+    encoder_name='resnet34',
+    encoder_weights=None,  # 不需要预训练权重，因为我们会加载训练好的权重
+    in_channels=3,
+    classes=21
+)
 try:
-    # Add weights_only=True to eliminate warnings
-    weights = torch.load("checkpoints/best.pt", map_location=device, weights_only=True)
+    weights = torch.load("checkpoints/unet_finetuned.pth", map_location=device)
     model.load_state_dict(weights)
     print("Model loaded successfully, weights contain the following layers:", list(weights.keys())[:5], "...")
 except Exception as e:
@@ -98,10 +39,11 @@ except Exception as e:
 model.to(device)
 model.eval()
 
-# 3. Preprocessing consistent with training
+# 3. 使用与训练时相同的预处理
 preprocess = transforms.Compose([
-    transforms.Resize((512, 512)),  # Ensure the same size as used in training
+    transforms.Resize((512, 512)),  # 确保与训练时相同的尺寸
     transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # 添加归一化
 ])
 
 @app.post("/predict")

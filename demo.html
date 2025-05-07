@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>UNet++ Segmentation Demo</title>
+  <title>UNet Segmentation Demo</title>
   <style>
     body {
       font-family: sans-serif;
@@ -29,62 +29,85 @@
       top: 0;
       left: 0;
     }
-    #controls {
-      margin-bottom: 10px;
+    #legend {
+      margin-top: 20px;
+      display: none;
     }
-    #controls label, #controls select {
-      margin-right: 10px;
+    .legend-item {
+      display: inline-block;
+      margin-right: 15px;
+      margin-bottom: 5px;
+    }
+    .color-box {
+      display: inline-block;
+      width: 15px;
+      height: 15px;
+      margin-right: 5px;
+      vertical-align: middle;
     }
   </style>
 </head>
 <body>
 
-  <h2>UNet++ Segmentation Demo</h2>
+  <h2>UNet 语义分割演示</h2>
 
   <div id="upload-box">
-    Drag and drop or click to upload image<br>
+    拖放或点击上传图片<br>
     <input type="file" id="fileInput" accept="image/*" style="display:none">
-  </div>
-
-  <div id="controls" style="display:none">
-    <label for="categorySelect">Select category:</label>
-    <select id="categorySelect"></select>
   </div>
 
   <div id="canvasContainer" style="display:none">
     <canvas id="imageCanvas"></canvas>
     <canvas id="maskCanvas"></canvas>
   </div>
+  
+  <div id="legend"></div>
 
   <script>
-    // VOC 2012 class mapping
+    // VOC 2012 类别映射
     const VOC_CLASSES = [
       'background','aeroplane','bicycle','bird','boat',
       'bottle','bus','car','cat','chair',
       'cow','diningtable','dog','horse','motorbike',
       'person','pottedplant','sheep','sofa','train','tvmonitor'
     ];
+    
+    // VOC 颜色映射 (21个类别，包括背景)
+    const VOC_COLORMAP = [
+      [0, 0, 0],        // background
+      [128, 0, 0],      // aeroplane
+      [0, 128, 0],      // bicycle
+      [128, 128, 0],    // bird
+      [0, 0, 128],      // boat
+      [128, 0, 128],    // bottle
+      [0, 128, 128],    // bus
+      [128, 128, 128],  // car
+      [64, 0, 0],       // cat
+      [192, 0, 0],      // chair
+      [64, 128, 0],     // cow
+      [192, 128, 0],    // diningtable
+      [64, 0, 128],     // dog
+      [192, 0, 128],    // horse
+      [64, 128, 128],   // motorbike
+      [192, 128, 128],  // person
+      [0, 64, 0],       // pottedplant
+      [128, 64, 0],     // sheep
+      [0, 192, 0],      // sofa
+      [128, 192, 0],    // train
+      [0, 64, 128]      // tvmonitor
+    ];
 
     const uploadBox = document.getElementById('upload-box');
     const fileInput = document.getElementById('fileInput');
-    const categorySelect = document.getElementById('categorySelect');
-    const controls = document.getElementById('controls');
     const canvasContainer = document.getElementById('canvasContainer');
     const imageCanvas = document.getElementById('imageCanvas');
     const maskCanvas = document.getElementById('maskCanvas');
+    const legendDiv = document.getElementById('legend');
 
     let maskData = null;
     let imgWidth = 0, imgHeight = 0;
 
-    // Fill category dropdown
-    VOC_CLASSES.forEach((name, idx) => {
-      const opt = document.createElement('option');
-      opt.value = idx;
-      opt.text = `${idx}: ${name}`;
-      categorySelect.appendChild(opt);
-    });
-
-    // Event binding
+    // 事件绑定
     uploadBox.addEventListener('click', () => fileInput.click());
     uploadBox.addEventListener('dragover', e => {
       e.preventDefault();
@@ -97,9 +120,6 @@
       handleFile(e.dataTransfer.files[0]);
     });
     fileInput.addEventListener('change', () => handleFile(fileInput.files[0]));
-    categorySelect.addEventListener('change', () => {
-      if (maskData) drawMask();
-    });
 
     function handleFile(file) {
       if (!file) return;
@@ -113,22 +133,21 @@
     }
 
     function processImage(img) {
-      imgWidth  = img.width;
+      imgWidth = img.width;
       imgHeight = img.height;
       [imageCanvas, maskCanvas].forEach(cv => {
-        cv.width  = imgWidth;
+        cv.width = imgWidth;
         cv.height = imgHeight;
       });
-      // Draw original image
+      // 绘制原始图像
       const ctx = imageCanvas.getContext('2d');
       ctx.clearRect(0, 0, imgWidth, imgHeight);
       ctx.drawImage(img, 0, 0, imgWidth, imgHeight);
 
-      // Show controls
-      controls.style.display = 'block';
+      // 显示画布容器
       canvasContainer.style.display = 'inline-block';
 
-      // Send to backend
+      // 发送到后端
       sendToBackend();
     }
 
@@ -139,38 +158,81 @@
         fetch('http://127.0.0.1:8000/predict', { method: 'POST', body: form })
           .then(res => res.json())
           .then(json => {
-            maskData = json.mask;  // Expect mask: [w*h] flat array
-            // Validate if mask data is empty or contains only one category
+            maskData = json.mask;  // 获取预测的掩码数据
+            // 检查掩码中有哪些类别
             const uniqueValues = new Set(maskData);
-            console.log("Unique values in mask:", Array.from(uniqueValues));
-            drawMask();
+            console.log("掩码中的唯一值:", Array.from(uniqueValues));
+            drawMask(json.class_confidences); // 传递类别置信度给drawMask
           })
           .catch(err => {
-            console.error('Prediction failed', err);
-            alert('Model inference failed, please check the backend /predict endpoint');
+            console.error('预测失败', err);
+            alert('模型推理失败，请检查后端/predict接口');
           });
       });
     }
 
-    function drawMask() {
-      const categoryId = parseInt(categorySelect.value);
+    function drawMask(classConfidences = {}) {
       const ctx = maskCanvas.getContext('2d');
       const imgData = ctx.createImageData(imgWidth, imgHeight);
+      
+      // 先清空画布
+      ctx.clearRect(0, 0, imgWidth, imgHeight);
+      
+      // 使用与训练集相同的颜色映射填充掩码
       for (let i = 0, len = maskData.length; i < len; i++) {
-        const lbl = maskData[i];
-        const j = i * 4;
-        if (lbl === categoryId) {
-          imgData.data[j + 0] = 255; // R
-          imgData.data[j + 1] = 0;   // G
-          imgData.data[j + 2] = 0;   // B
-          imgData.data[j + 3] = 128; // 0.5 alpha
-        } else {
-          imgData.data[j + 3] = 0;
+        const classId = maskData[i];
+        if (classId > 0) { // 跳过背景类(0)
+          const j = i * 4;
+          const color = VOC_COLORMAP[classId];
+          imgData.data[j + 0] = color[0]; // R
+          imgData.data[j + 1] = color[1]; // G
+          imgData.data[j + 2] = color[2]; // B
+          imgData.data[j + 3] = 180;      // 0.7 alpha
         }
       }
+      
       ctx.putImageData(imgData, 0, 0);
+      
+      // 生成图例
+      generateLegend(classConfidences);
+    }
+    
+    function generateLegend(classConfidences) {
+      // 清空当前图例
+      legendDiv.innerHTML = '';
+      
+      // 获取图像中存在的类别
+      const presentClasses = new Set(maskData);
+      presentClasses.delete(0); // 移除背景类别
+      
+      if (presentClasses.size) {
+        legendDiv.style.display = 'block';
+        presentClasses.forEach(classId => {
+          const color = VOC_COLORMAP[classId];
+          const legendItem = document.createElement('div');
+          legendItem.className = 'legend-item';
+          
+          const colorBox = document.createElement('span');
+          colorBox.className = 'color-box';
+          colorBox.style.backgroundColor = `rgb(${color[0]}, ${color[1]}, ${color[2]})`;
+          
+          const className = document.createElement('span');
+          className.textContent = VOC_CLASSES[classId];
+          
+          const confidence = document.createElement('span');
+          confidence.textContent = ` (${(classConfidences[classId] * 100).toFixed(2)}%)`;
+          
+          legendItem.appendChild(colorBox);
+          legendItem.appendChild(className);
+          legendItem.appendChild(confidence);
+          
+          legendDiv.appendChild(legendItem);
+        });
+      } else {
+        legendDiv.style.display = 'none';
+      }
     }
   </script>
-
 </body>
 </html>
+<!-- End of demo.html -->
