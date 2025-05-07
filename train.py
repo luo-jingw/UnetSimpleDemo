@@ -77,36 +77,24 @@ def cross_entropy_loss(pred, target, weights=None):
         target = target.long()
     return F.cross_entropy(pred, target, weight=weights, ignore_index=255, reduction='mean')
 
-# Dice Loss implementation
-def dice_loss(pred, target, smooth=1.0):
-    """Dice loss function"""
-    # Ensure target is Long type
-    if target.dtype != torch.long:
-        target = target.long()
-        
-    pred = F.softmax(pred, dim=1)
+def calculate_loss(outputs, target, class_weights=None):
+    """
+    简化的损失计算函数，仅使用交叉熵损失
+    outputs: 模型的输出元组 (output0, output1, output2)
+    target: 目标分割掩码
+    class_weights: 可选的类别权重
+    """
+    output0, output1, output2 = outputs
     
-    # Ignore 255 labels (boundary regions)
-    valid_mask = (target != 255)
-    target = target * valid_mask
+    # 主输出和辅助输出的交叉熵损失
+    main_loss = cross_entropy_loss(output0, target, class_weights)
+    aux1_loss = cross_entropy_loss(output1, target, class_weights)
+    aux2_loss = cross_entropy_loss(output2, target, class_weights)
     
-    # One-hot encoding
-    target_one_hot = torch.zeros_like(pred)
-    target_one_hot.scatter_(1, target.unsqueeze(1), 1)
+    # 按权重组合损失 (主输出权重更高)
+    loss = main_loss + 0.4 * aux1_loss + 0.2 * aux2_loss
     
-    # Calculate Dice coefficient
-    intersection = (pred * target_one_hot).sum(dim=(2, 3))
-    union = pred.sum(dim=(2, 3)) + target_one_hot.sum(dim=(2, 3))
-    dice = (2. * intersection + smooth) / (union + smooth)
-    
-    return 1 - dice.mean()
-
-# Combined loss function
-def combined_loss(pred, target, weights=None, dice_weight=0.5):
-    """Combine cross entropy and Dice loss"""
-    ce_loss = cross_entropy_loss(pred, target, weights)
-    dc_loss = dice_loss(pred, target)
-    return ce_loss + dice_weight * dc_loss
+    return loss
 
 # ------------------------------ Training Function ------------------------------
 def train_one_epoch(model, train_loader, optimizer, device, epoch, logger, class_weights=None):
@@ -134,12 +122,7 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, logger, class
         output0, output1, output2 = model(data)
         
         # Calculate loss - main output and auxiliary outputs
-        main_loss = combined_loss(output0, target, class_weights, dice_weight=0.5)
-        aux1_loss = cross_entropy_loss(output1, target, class_weights)
-        aux2_loss = cross_entropy_loss(output2, target, class_weights)
-        
-        # Combined loss
-        loss = main_loss + 0.4 * aux1_loss + 0.2 * aux2_loss
+        loss = calculate_loss((output0, output1, output2), target, class_weights)
         
         # Backward pass
         loss.backward()
@@ -188,7 +171,7 @@ def validate(model, val_loader, device, logger, class_weights=None):
             output0, _, _ = model(data)
             
             # Calculate loss
-            loss = combined_loss(output0, target, class_weights, dice_weight=0.5)
+            loss = cross_entropy_loss(output0, target, class_weights)
             val_loss += loss.item()
             
             # Calculate IoU
@@ -245,12 +228,18 @@ def visualize_predictions(model, val_loader, device, output_dir, epoch, num_samp
             # Get predicted class
             pred = outputs[0].argmax(0).cpu()
             
+            # 修复：确保预测的类别索引在合法范围内（0-20）
+            pred = torch.clamp(pred, 0, 20)
+            
             # Print predicted class distribution
             unique_classes, counts = np.unique(pred.numpy(), return_counts=True)
             print(f"Predicted class distribution: {list(zip(unique_classes, counts))}")
             
             # Convert to visualization format
             img_np = images[0].permute(1, 2, 0).numpy()
+            # 反归一化处理
+            img_np = img_np * np.array([0.229, 0.224, 0.225]) + np.array([0.485, 0.456, 0.406])
+            img_np = np.clip(img_np, 0, 1)
             img_np = (img_np * 255).astype(np.uint8)
             
             # In VOC masks, 255 represents ignore regions, set to 0 (background) for display
@@ -397,8 +386,11 @@ def train(args):
     
     plt.figure(figsize=(15, 10))
     for i in range(min(4, len(sample_images))):
-        # Convert to NumPy arrays
+        # Convert to NumPy arrays and un-normalize
         img = sample_images[i].permute(1, 2, 0).numpy()
+        # 添加反归一化处理
+        img = img * np.array([0.229, 0.224, 0.225]) + np.array([0.485, 0.456, 0.406])
+        img = np.clip(img, 0, 1)
         img = (img * 255).astype(np.uint8)
         
         mask = sample_masks[i].clone()

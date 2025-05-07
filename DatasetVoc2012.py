@@ -47,7 +47,7 @@ class VOC2012Dataset(Dataset):
     """
     
     def __init__(self, root='voc_data', split='train', transform=None, target_transform=None, 
-                 img_size=512, use_augmentation=True, aug_mode='light'):
+                 img_size=512, use_augmentation=True):
         """
         Initialize VOC2012 dataset
         
@@ -58,12 +58,10 @@ class VOC2012Dataset(Dataset):
             target_transform: Custom label transformation function (will override default transformations)
             img_size: Output image size
             use_augmentation: Whether to use data augmentation (only applied for training split)
-            aug_mode: Augmentation mode - 'light', 'medium', or 'heavy'
         """
         self.split = split
         self.img_size = img_size
         self.use_augmentation = use_augmentation and split == 'train'
-        self.aug_mode = aug_mode
         
         # Initialize custom transformations if provided
         self.custom_img_transform = transform
@@ -98,21 +96,24 @@ class VOC2012Dataset(Dataset):
             transforms.PILToTensor(),
         ])
         
-        # 统一简化的增强方式，仅包含基础的空间变换
-        self.spatial_transforms = transforms.Compose([
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1)),
-            transforms.Resize((self.img_size, self.img_size))
-        ])
-        
-        # 图像特定的后处理
-        self.img_post_transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-        
-        # 掩码特定的后处理
-        self.mask_post_transform = transforms.PILToTensor()
+        # 数据增强变换
+        if self.use_augmentation:
+            # 同步应用于图像和掩码的空间变换
+            self.spatial_transforms = transforms.Compose([
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1), 
+                                       interpolation=Image.NEAREST),
+                transforms.Resize((self.img_size, self.img_size), interpolation=Image.NEAREST)
+            ])
+            
+            # 图像特定的后处理
+            self.img_post_transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
+            
+            # 掩码特定的后处理
+            self.mask_post_transform = transforms.PILToTensor()
     
     def __len__(self):
         return len(self.dataset)
@@ -163,6 +164,12 @@ class VOC2012Dataset(Dataset):
         """
         if isinstance(mask, torch.Tensor):
             mask = mask.numpy()
+        
+        # 将掩码转换为整数类型，确保没有中间值
+        mask = mask.astype(np.int32)
+        
+        # 剪裁确保掩码值在有效范围内 (0-20)
+        mask = np.clip(mask, 0, 20)
         
         h, w = mask.shape
         rgb = np.zeros((h, w, 3), dtype=np.uint8)
@@ -255,7 +262,7 @@ class VOC2012Dataset(Dataset):
 
 # Usage example
 def create_voc_dataloaders(root='voc_data', batch_size=8, img_size=512, num_workers=2, 
-                       use_augmentation=True, aug_mode='medium'):
+                       use_augmentation=True):
     """
     Create training and validation data loaders for VOC2012 dataset
     
@@ -265,7 +272,6 @@ def create_voc_dataloaders(root='voc_data', batch_size=8, img_size=512, num_work
         img_size: Image size
         num_workers: Number of data loading threads
         use_augmentation: Whether to use data augmentation for training
-        aug_mode: Augmentation mode - 'light', 'medium', or 'heavy'
         
     Returns:
         train_loader, val_loader: Training and validation data loaders
@@ -275,8 +281,7 @@ def create_voc_dataloaders(root='voc_data', batch_size=8, img_size=512, num_work
         root=root,
         split='train',
         img_size=img_size,
-        use_augmentation=use_augmentation,
-        aug_mode=aug_mode
+        use_augmentation=use_augmentation
     )
     
     # Create validation dataset (no augmentation for validation)
@@ -359,18 +364,18 @@ if __name__ == "__main__":
     
     # 2. Visualize augmentations
     # Create a dataset with all augmentation modes for comparison
-    aug_modes = ['light', 'medium', 'heavy']
-    
-    for mode in aug_modes:
-        train_ds = VOC2012Dataset(split='train', img_size=512, use_augmentation=True, aug_mode=mode)
-        fig = train_ds.visualize_augmentations(idx=0, n_samples=3)
-        plt.savefig(f'augmented_samples_{mode}.png')
-        plt.close()
+
+    train_ds = VOC2012Dataset(split='train', img_size=512, use_augmentation=True)
+    fig = train_ds.visualize_augmentations(idx=0, n_samples=3)
+    plt.savefig('training_samples.png')
+    plt.close()
     
     # 3. Test a batch from the data loader
-    train_loader, _ = create_voc_dataloaders(batch_size=4, img_size=512, aug_mode='light')
+    train_loader, _ = create_voc_dataloaders(batch_size=4, img_size=512)
     batch = next(iter(train_loader))
     images, masks = batch
     
     print(f"Batch shape: images={images.shape}, masks={masks.shape}")
     print("Training with data augmentation is ready!")
+
+    print(f"Batch: images={images[0]}, masks={masks[0]}")
