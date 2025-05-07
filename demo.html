@@ -254,6 +254,9 @@
             const progress = data.progress;
             progressBar.style.width = progress + '%';
             progressBar.textContent = `Processed ${data.frames_processed}/${data.total_frames} frames (${Math.round(progress)}%)`;
+            
+            // Make sure the progress container is visible
+            progressContainer.style.display = 'block';
           }
         } catch (e) {
           console.error('WebSocket message parsing error:', e);
@@ -399,7 +402,8 @@
       
       // When upload completes
       xhr.upload.onload = function() {
-        progressBar.textContent = 'Processing...';
+        progressBar.style.width = '0%'; // Reset progress bar for processing phase
+        progressBar.textContent = 'Waiting for processing to start...';
         // Progress will be updated via WebSocket
       };
       
