@@ -60,36 +60,37 @@ async def predict(file: UploadFile = File(...)):
     x = preprocess(img).unsqueeze(0).to(device)    # [1,3,512,512]
     print(f"Input tensor shape: {x.shape}")
     
-    # 3.3 Inference
+    # 3.3 Inference - 优化处理流程，参考unet_train.py中的实现
     with torch.no_grad():
-        logits = model(x)                          # [1,21,512,512]
-        print(f"Output logits shape: {logits.shape}")
+        output = model(x)                          # [1,21,512,512]
+        print(f"Output shape: {output.shape}")
         
-        # Get probabilities with softmax
-        probs = F.softmax(logits, dim=1)
+        # 直接使用argmax获取预测的类别索引 - 这样可以避免条纹问题
+        mask = torch.argmax(output, dim=1).squeeze(0).cpu().numpy()  # [512,512]
         
-        # Get predicted class and confidence score
-        confidence, mask = torch.max(probs, dim=1)
-        
-        # Extract as numpy arrays
-        mask = mask.squeeze(0).cpu().numpy()  # [512,512]
-        confidence = confidence.squeeze(0).cpu().numpy()  # [512,512]
+        # 获取每个类别的置信度
+        probs = F.softmax(output, dim=1).squeeze(0)  # [21,512,512]
         
         print(f"Class distribution: {np.unique(mask).tolist()}")
     
     # 3.4 Return mask data and original image dimensions
     flat_mask = mask.flatten().tolist()
-    flat_confidence = confidence.flatten().tolist()
     
     # Calculate average confidence per class
     class_confidences = {}
     for cls in np.unique(mask):
-        class_confidences[int(cls)] = float(np.mean(confidence[mask == cls]))
+        # 对于每个类别，计算其平均置信度
+        cls_idx = int(cls)
+        if cls_idx < probs.shape[0]:  # 确保类别索引在有效范围内
+            class_mask = (mask == cls_idx)
+            if np.any(class_mask):  # 确保有像素属于该类别
+                class_confidences[cls_idx] = float(probs[cls_idx][class_mask].mean().cpu())
     
     print(f"Returned mask length: {len(flat_mask)}, value range: {min(flat_mask)} - {max(flat_mask)}")
+    print(f"Detected classes with confidences: {class_confidences}")
+    
     return {
         "mask": flat_mask,
-        "confidence": flat_confidence,
         "class_confidences": class_confidences,
         "width": original_width,
         "height": original_height,
