@@ -15,6 +15,24 @@
       text-align: center;
       margin-bottom: 25px;
     }
+    .tab-container {
+      display: flex;
+      justify-content: center;
+      margin-bottom: 20px;
+    }
+    .tab {
+      padding: 10px 20px;
+      background: #f5f5f5;
+      border: 1px solid #ddd;
+      cursor: pointer;
+      margin: 0 5px;
+      border-radius: 5px;
+    }
+    .tab.active {
+      background: #007bff;
+      color: white;
+      border-color: #007bff;
+    }
     #upload-box {
       border: 2px dashed #888;
       padding: 40px;
@@ -61,6 +79,19 @@
       display: block;
       width: 100%;
       height: auto;
+    }
+    .video-container {
+      width: 100%;
+      margin-top: 20px;
+      text-align: center;
+      display: none;
+    }
+    .video-result {
+      max-width: 100%;
+      max-height: 80vh;
+      border: 1px solid #ddd;
+      border-radius: 5px;
+      box-shadow: 0 2px 5px rgba(0,0,0,0.1);
     }
     .legend {
       margin-top: 20px;
@@ -115,14 +146,41 @@
       color: #666;
       font-size: 0.9em;
     }
+    .progress-container {
+      width: 100%;
+      height: 20px;
+      background-color: #f0f0f0;
+      border-radius: 5px;
+      margin: 15px 0;
+      overflow: hidden;
+      display: none;
+    }
+    .progress-bar {
+      height: 100%;
+      background-color: #4CAF50;
+      text-align: center;
+      line-height: 20px;
+      color: white;
+      transition: width 0.3s ease;
+      width: 0;
+    }
   </style>
 </head>
 <body>
   <h2>UNet Segmentation Demo</h2>
 
+  <div class="tab-container">
+    <div class="tab active" id="image-tab">Image Mode</div>
+    <div class="tab" id="video-tab">Video Mode</div>
+  </div>
+
   <div id="upload-box">
-    Drag and drop or click to upload an image<br>
+    <span id="upload-text">Drag and drop or click to upload an image</span><br>
     <input type="file" id="fileInput" accept="image/*" style="display:none">
+  </div>
+
+  <div class="progress-container" id="progressContainer">
+    <div class="progress-bar" id="progressBar">0%</div>
   </div>
 
   <div id="spinner" class="spinner"></div>
@@ -142,21 +200,105 @@
     </div>
   </div>
 
+  <div id="videoContainer" class="video-container">
+    <h3>Segmentation Result</h3>
+    <video id="resultVideo" class="video-result" controls></video>
+  </div>
+
   <div id="legend" class="legend">
     <h3>Detected Classes:</h3>
     <div id="legendItems" class="legend-items"></div>
   </div>
 
   <script>
+    const imageTab = document.getElementById('image-tab');
+    const videoTab = document.getElementById('video-tab');
     const uploadBox = document.getElementById('upload-box');
+    const uploadText = document.getElementById('upload-text');
     const fileInput = document.getElementById('fileInput');
     const resultContainer = document.getElementById('resultContainer');
     const originalImg = document.getElementById('originalImg');
     const maskImg = document.getElementById('maskImg');
     const overlayImg = document.getElementById('overlayImg');
+    const videoContainer = document.getElementById('videoContainer');
+    const resultVideo = document.getElementById('resultVideo');
     const legend = document.getElementById('legend');
     const legendItems = document.getElementById('legendItems');
     const spinner = document.getElementById('spinner');
+    const progressContainer = document.getElementById('progressContainer');
+    const progressBar = document.getElementById('progressBar');
+    
+    let currentMode = 'image'; // Default is image mode
+    let ws = null; // WebSocket connection
+    let clientId = 'client_' + Date.now(); // Generate unique client ID
+    
+    // WebSocket connection function
+    function connectWebSocket() {
+      if (ws) {
+        // If connection exists, close it first
+        ws.close();
+      }
+      
+      // Create new connection
+      ws = new WebSocket(`ws://127.0.0.1:8000/ws/${clientId}`);
+      
+      ws.onopen = function() {
+        console.log('WebSocket connection established');
+      };
+      
+      ws.onmessage = function(event) {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === 'progress') {
+            // Update progress bar based on frame processing
+            const progress = data.progress;
+            progressBar.style.width = progress + '%';
+            progressBar.textContent = `Processed ${data.frames_processed}/${data.total_frames} frames (${Math.round(progress)}%)`;
+          }
+        } catch (e) {
+          console.error('WebSocket message parsing error:', e);
+        }
+      };
+      
+      ws.onclose = function() {
+        console.log('WebSocket connection closed');
+        // Could add reconnection logic here, but keeping it simple
+      };
+      
+      ws.onerror = function(error) {
+        console.error('WebSocket error:', error);
+      };
+    }
+    
+    // Connect WebSocket on page load
+    window.addEventListener('load', connectWebSocket);
+    
+    // Tab switching events
+    imageTab.addEventListener('click', () => switchMode('image'));
+    videoTab.addEventListener('click', () => switchMode('video'));
+
+    function switchMode(mode) {
+      currentMode = mode;
+      
+      if (mode === 'image') {
+        imageTab.classList.add('active');
+        videoTab.classList.remove('active');
+        fileInput.accept = 'image/*';
+        uploadText.textContent = 'Drag and drop or click to upload an image';
+      } else {
+        videoTab.classList.add('active');
+        imageTab.classList.remove('active');
+        fileInput.accept = 'video/*';
+        uploadText.textContent = 'Drag and drop or click to upload a video';
+      }
+      
+      // Reset UI state
+      resultContainer.style.display = 'none';
+      videoContainer.style.display = 'none';
+      legend.style.display = 'none';
+      spinner.style.display = 'none';
+      progressContainer.style.display = 'none';
+    }
     
     // Bind upload events
     uploadBox.addEventListener('click', () => fileInput.click());
@@ -176,24 +318,37 @@
     function handleFile(file) {
       if (!file) return;
       
-      // Display original image
-      const reader = new FileReader();
-      reader.onload = evt => {
-        originalImg.src = evt.target.result;
-        sendToBackend(file);
-      };
-      reader.readAsDataURL(file);
-      
-      // Show loading animation
-      spinner.style.display = 'block';
-      resultContainer.style.display = 'none';
-      legend.style.display = 'none';
+      if (currentMode === 'image') {
+        // Image processing mode
+        const reader = new FileReader();
+        reader.onload = evt => {
+          originalImg.src = evt.target.result;
+          sendImageToBackend(file);
+        };
+        reader.readAsDataURL(file);
+        
+        // Show loading animation
+        spinner.style.display = 'block';
+        resultContainer.style.display = 'none';
+        videoContainer.style.display = 'none';
+        legend.style.display = 'none';
+      } else {
+        // Video processing mode
+        sendVideoToBackend(file);
+        
+        // Show loading progress bar
+        progressContainer.style.display = 'block';
+        spinner.style.display = 'block';
+        resultContainer.style.display = 'none';
+        videoContainer.style.display = 'none';
+        legend.style.display = 'none';
+      }
     }
 
-    // Send to backend for processing
-    function sendToBackend(file) {
+    // Send image to backend for processing
+    function sendImageToBackend(file) {
       const form = new FormData();
-      form.append('file', file, 'input.png');
+      form.append('file', file);
       
       fetch('http://127.0.0.1:8000/predict', {
         method: 'POST',
@@ -206,27 +361,126 @@
         return res.json();
       })
       .then(data => {
-        displayResults(data);
+        displayImageResults(data);
       })
       .catch(err => {
         console.error('Prediction failed:', err);
-        alert('Model inference failed. Please check that the backend service is running.');
+        alert('Model inference failed. Please check if backend service is running.');
         spinner.style.display = 'none';
       });
     }
+    
+    // Send video to backend for processing
+    function sendVideoToBackend(file) {
+      // Check file size
+      if (file.size > 100 * 1024 * 1024) { // 100MB
+        alert('Video file is too large. Please upload a video smaller than 100MB.');
+        spinner.style.display = 'none';
+        progressContainer.style.display = 'none';
+        return;
+      }
+      
+      const form = new FormData();
+      form.append('file', file);
+      
+      // Create custom request with client ID
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', 'http://127.0.0.1:8000/predict_video', true);
+      xhr.setRequestHeader('X-Client-ID', clientId);  // Add client ID to headers
+      
+      // Upload progress monitoring
+      xhr.upload.onprogress = function(e) {
+        if (e.lengthComputable) {
+          const percentComplete = (e.loaded / e.total) * 100;
+          progressBar.style.width = percentComplete + '%';
+          progressBar.textContent = `Uploading: ${Math.round(percentComplete)}%`;
+        }
+      };
+      
+      // When upload completes
+      xhr.upload.onload = function() {
+        progressBar.textContent = 'Processing...';
+        // Progress will be updated via WebSocket
+      };
+      
+      // Request completion handler
+      xhr.onload = function() {
+        if (xhr.status === 200) {
+          try {
+            const data = JSON.parse(xhr.responseText);
+            displayVideoResults(data);
+          } catch (e) {
+            console.error('Error parsing response data:', e);
+            alert('Error processing video. Could not parse results.');
+            spinner.style.display = 'none';
+            progressContainer.style.display = 'none';
+          }
+        } else {
+          console.error('Video processing failed:', xhr.statusText);
+          alert(`Video processing failed (${xhr.status}). Please check backend service.`);
+          spinner.style.display = 'none';
+          progressContainer.style.display = 'none';
+        }
+      };
+      
+      // Request error handler
+      xhr.onerror = function() {
+        console.error('Request error');
+        alert('Request error. Cannot connect to backend service.');
+        spinner.style.display = 'none';
+        progressContainer.style.display = 'none';
+      };
+      
+      // Send request
+      xhr.send(form);
+    }
 
-    // Display prediction results
-    function displayResults(data) {
+    // Display image processing results
+    function displayImageResults(data) {
       // Hide loading animation
       spinner.style.display = 'none';
       
       // Show results container
       resultContainer.style.display = 'flex';
+      videoContainer.style.display = 'none';
       
       // Set mask and overlay images
       originalImg.src = data.original_base64;
       maskImg.src = data.mask_base64;
       overlayImg.src = data.overlay_base64;
+      
+      // Generate class legend
+      generateLegend(data.detected_classes);
+    }
+    
+    // Display video processing results
+    function displayVideoResults(data) {
+      // Hide loading animation and progress bar
+      spinner.style.display = 'none';
+      progressContainer.style.display = 'none';
+      
+      // Show video results
+      resultContainer.style.display = 'none';
+      videoContainer.style.display = 'block';
+      
+      // Set video source and play
+      resultVideo.src = data.video_base64;
+      resultVideo.load();
+      
+      // Add video loading event listeners
+      resultVideo.addEventListener('loadeddata', function() {
+        console.log('Video loaded, ready to play');
+      });
+      
+      resultVideo.addEventListener('error', function(e) {
+        console.error('Video loading error:', e);
+        // Show more detailed error information
+        const mediaError = resultVideo.error;
+        if (mediaError) {
+          console.error(`Media error: ${mediaError.code} - ${mediaError.message}`);
+        }
+        alert('Video cannot be played. Check console for detailed error information.');
+      });
       
       // Generate class legend
       generateLegend(data.detected_classes);
@@ -240,34 +494,66 @@
       if (classes.length > 0) {
         legend.style.display = 'block';
         
-        // Sort classes by confidence
-        classes.sort((a, b) => b.confidence - a.confidence);
-        
-        classes.forEach(cls => {
-          const item = document.createElement('div');
-          item.className = 'legend-item';
+        // Adjust display fields for video mode
+        if (currentMode === 'video') {
+          classes.forEach(cls => {
+            const item = document.createElement('div');
+            item.className = 'legend-item';
+            
+            const colorBox = document.createElement('span');
+            colorBox.className = 'color-box';
+            colorBox.style.backgroundColor = `rgb(${cls.color[0]}, ${cls.color[1]}, ${cls.color[2]})`;
+            
+            const nameSpan = document.createElement('span');
+            nameSpan.textContent = cls.name;
+            
+            const statsSpan = document.createElement('span');
+            statsSpan.className = 'confidence';
+            statsSpan.textContent = ` (Frames: ${cls.frames}, Confidence: ${(cls.avg_confidence * 100).toFixed(1)}%)`;
+            
+            item.appendChild(colorBox);
+            item.appendChild(nameSpan);
+            item.appendChild(statsSpan);
+            
+            legendItems.appendChild(item);
+          });
+        } else {
+          // Image mode original sorting logic
+          classes.sort((a, b) => b.confidence - a.confidence);
           
-          const colorBox = document.createElement('span');
-          colorBox.className = 'color-box';
-          colorBox.style.backgroundColor = `rgb(${cls.color[0]}, ${cls.color[1]}, ${cls.color[2]})`;
-          
-          const nameSpan = document.createElement('span');
-          nameSpan.textContent = cls.name;
-          
-          const confidenceSpan = document.createElement('span');
-          confidenceSpan.className = 'confidence';
-          confidenceSpan.textContent = ` (${(cls.confidence * 100).toFixed(1)}%)`;
-          
-          item.appendChild(colorBox);
-          item.appendChild(nameSpan);
-          item.appendChild(confidenceSpan);
-          
-          legendItems.appendChild(item);
-        });
+          classes.forEach(cls => {
+            const item = document.createElement('div');
+            item.className = 'legend-item';
+            
+            const colorBox = document.createElement('span');
+            colorBox.className = 'color-box';
+            colorBox.style.backgroundColor = `rgb(${cls.color[0]}, ${cls.color[1]}, ${cls.color[2]})`;
+            
+            const nameSpan = document.createElement('span');
+            nameSpan.textContent = cls.name;
+            
+            const confidenceSpan = document.createElement('span');
+            confidenceSpan.className = 'confidence';
+            confidenceSpan.textContent = ` (${(cls.confidence * 100).toFixed(1)}%)`;
+            
+            item.appendChild(colorBox);
+            item.appendChild(nameSpan);
+            item.appendChild(confidenceSpan);
+            
+            legendItems.appendChild(item);
+          });
+        }
       } else {
         legend.style.display = 'none';
       }
     }
+    
+    // Clean up WebSocket connection before page unload
+    window.addEventListener('beforeunload', function() {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.close();
+      }
+    });
   </script>
 </body>
 </html>
