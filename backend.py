@@ -11,6 +11,10 @@ from PIL import Image
 from torchvision import transforms
 import numpy as np
 import segmentation_models_pytorch as smp
+import cv2
+
+# 从DatasetVoc2012导入颜色映射
+from DatasetVoc2012 import VOC_COLORMAP, VOC_CLASSES
 
 # 1. Create FastAPI application and enable CORS
 app = FastAPI()
@@ -46,6 +50,29 @@ preprocess = transforms.Compose([
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # 添加归一化
 ])
 
+def decode_segmap(mask):
+    """
+    将分割掩码转换为RGB彩色图像
+    mask: [H, W] tensor with class indices 0-20
+    returns: [H, W, 3] numpy array, RGB color image
+    """
+    if isinstance(mask, torch.Tensor):
+        mask = mask.numpy()
+    
+    # 将掩码转换为整数类型，确保没有中间值
+    mask = mask.astype(np.int32)
+    
+    # 剪裁确保掩码值在有效范围内 (0-20)
+    mask = np.clip(mask, 0, 20)
+    
+    h, w = mask.shape
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    
+    for cls in range(21):
+        rgb[mask == cls] = VOC_COLORMAP[cls]
+            
+    return rgb
+
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     # 3.1 Read and convert to RGB
@@ -56,16 +83,20 @@ async def predict(file: UploadFile = File(...)):
     # Store original image dimensions
     original_width, original_height = img.size
     
+    # 保存原始图像以便后续合并
+    original_img_resized = img.resize((512, 512))
+    original_img_np = np.array(original_img_resized)
+    
     # 3.2 Preprocess + add batch dimension
     x = preprocess(img).unsqueeze(0).to(device)    # [1,3,512,512]
     print(f"Input tensor shape: {x.shape}")
     
-    # 3.3 Inference - 优化处理流程，参考unet_train.py中的实现
+    # 3.3 Inference
     with torch.no_grad():
         output = model(x)                          # [1,21,512,512]
         print(f"Output shape: {output.shape}")
         
-        # 直接使用argmax获取预测的类别索引 - 这样可以避免条纹问题
+        # 直接使用argmax获取预测的类别索引
         mask = torch.argmax(output, dim=1).squeeze(0).cpu().numpy()  # [512,512]
         
         # 获取每个类别的置信度
@@ -73,32 +104,53 @@ async def predict(file: UploadFile = File(...)):
         
         print(f"Class distribution: {np.unique(mask).tolist()}")
     
-    # 3.4 Return mask data and original image dimensions
-    flat_mask = mask.flatten().tolist()
+    # 3.4 生成彩色掩码
+    color_mask = decode_segmap(mask)
     
-    # Calculate average confidence per class
+    # 3.5 生成叠加效果（合并）
+    overlay = cv2.addWeighted(original_img_np, 0.7, color_mask, 0.3, 0)
+    
+    # 3.6 将图像转换为base64编码
+    mask_img = Image.fromarray(color_mask)
+    overlay_img = Image.fromarray(overlay)
+    
+    mask_buffer = io.BytesIO()
+    mask_img.save(mask_buffer, format="PNG")
+    mask_base64 = base64.b64encode(mask_buffer.getvalue()).decode('utf-8')
+    
+    overlay_buffer = io.BytesIO()
+    overlay_img.save(overlay_buffer, format="PNG")
+    overlay_base64 = base64.b64encode(overlay_buffer.getvalue()).decode('utf-8')
+    
+    # 3.7 准备返回的类别信息和置信度
     class_confidences = {}
-    for cls in np.unique(mask):
-        # 对于每个类别，计算其平均置信度
-        cls_idx = int(cls)
-        if cls_idx < probs.shape[0]:  # 确保类别索引在有效范围内
-            class_mask = (mask == cls_idx)
-            if np.any(class_mask):  # 确保有像素属于该类别
-                class_confidences[cls_idx] = float(probs[cls_idx][class_mask].mean().cpu())
+    detected_classes = []
     
-    print(f"Returned mask length: {len(flat_mask)}, value range: {min(flat_mask)} - {max(flat_mask)}")
-    print(f"Detected classes with confidences: {class_confidences}")
+    for cls in np.unique(mask):
+        if cls > 0:  # 忽略背景类
+            cls_idx = int(cls)
+            class_mask = (mask == cls_idx)
+            if np.any(class_mask):
+                class_confidence = float(probs[cls_idx][class_mask].mean().cpu())
+                class_confidences[cls_idx] = class_confidence
+                detected_classes.append({
+                    "id": cls_idx,
+                    "name": VOC_CLASSES[cls_idx],
+                    "confidence": class_confidence,
+                    "color": VOC_COLORMAP[cls_idx]
+                })
+    
+    print(f"Detected classes: {len(detected_classes)}")
     
     return {
-        "mask": flat_mask,
-        "class_confidences": class_confidences,
+        "mask_base64": f"data:image/png;base64,{mask_base64}",
+        "overlay_base64": f"data:image/png;base64,{overlay_base64}",
+        "detected_classes": detected_classes,
         "width": original_width,
-        "height": original_height,
-        "model_width": 512,
-        "model_height": 512
+        "height": original_height
     }
 
-# Add debug endpoint to backend.py
+# Add debug endpoint
 @app.get("/test_model")
 async def test_model():
     # Create test image (a solid color image)
